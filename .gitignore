@@ -1,0 +1,4 @@
+# compiled binary (15MB) — rebuild with: go build -o stacks .
+/stacks
+*.test
+*.out
