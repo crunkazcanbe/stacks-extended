@@ -2,6 +2,7 @@ package lib
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -301,6 +302,111 @@ func dispCompose(file string, args ...string) bool {
 	return cmd.Run() == nil
 }
 
+// ── STACKS LOADING BAR (faithful port of the bash reinit_ui/update_ui/clear_ui)
+// A fixed 4-line block redrawn in place, identical to the Python version:
+//
+//	📦 <stack> | ⚙️  <service>      (cyan)   ← current target
+//	  ⠋ <action>                    (blue)   ← spinner + what it's doing
+//	  [####>------] 42%             (blue)   ← the loading bar
+//	  🛑 Press Ctrl+C to cancel.     (gray)
+//
+// Docker output is captured into luiLog (shown only with the `info` flag) so the
+// screen stays clean instead of streaming raw pull progress.
+var (
+	luiActive  bool
+	luiStack   string
+	luiSvc     string
+	luiAction  string
+	luiPercent int
+	luiStart   time.Time
+	luiLog     bytes.Buffer
+)
+
+var luiSpin = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func luiInit(stack, svc string) {
+	luiActive = true
+	luiStack, luiSvc = stack, svc
+	luiStart = time.Now()
+	luiLog.Reset()
+	fmt.Print("\n\n\n\n\x1b[3A") // reserve 4 lines, park cursor at the top
+}
+
+func luiUpdate(action string, percent int) {
+	if !luiActive {
+		return
+	}
+	if percent > 100 {
+		percent = 100
+	} else if percent < 0 {
+		percent = 0
+	}
+	luiAction, luiPercent = action, percent
+	const barW = 36
+	filled := percent * barW / 100
+	empty := barW - filled - 1
+	if empty < 0 {
+		empty = 0
+	}
+	spin := luiSpin[int(time.Since(luiStart).Seconds())%10]
+	bar := strings.Repeat("#", filled) + ">" + strings.Repeat("-", empty)
+	target := vtrunc(fmt.Sprintf("📦 %s | ⚙️  %s", luiStack, vtrunc(luiSvc, 35)), 78)
+	actStr := vtrunc(fmt.Sprintf("  %s %s", spin, action), 78)
+	barStr := vtrunc(fmt.Sprintf("  [%s] %d%%", bar, percent), 78)
+	fmt.Printf("\x1b[?7l\r\x1b[K\x1b[38;5;81m%s\x1b[0m\n\r\x1b[K\x1b[38;5;75m%s\x1b[0m\n\r\x1b[K\x1b[38;5;39m%s\x1b[0m\n\r\x1b[K\x1b[38;5;245m  🛑 Press Ctrl+C to cancel.\x1b[0m\x1b[?7h\x1b[3A",
+		target, actStr, barStr)
+}
+
+func luiClear() {
+	if !luiActive {
+		return
+	}
+	fmt.Print("\r\x1b[K\n\r\x1b[K\n\r\x1b[K\n\r\x1b[K\r\x1b[3A")
+	luiActive = false
+}
+
+// dispComposeQ runs docker compose with output captured to luiLog (no raw spam),
+// redrawing the bar every ~150ms so the spinner stays alive during long pulls.
+func dispComposeQ(file string, args ...string) bool {
+	full := append([]string{"compose", "-f", file}, args...)
+	cmd := exec.Command("docker", full...)
+	cmd.Env = dispComposeEnv()
+	cmd.Stdout = &luiLog
+	cmd.Stderr = &luiLog
+	if !luiActive {
+		return cmd.Run() == nil
+	}
+	if cmd.Start() != nil {
+		return false
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	tick := time.NewTicker(150 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case err := <-done:
+			return err == nil
+		case <-tick.C:
+			luiUpdate(luiAction, luiPercent) // same action/percent, spinner advances
+		}
+	}
+}
+
+// dispShowTail prints the last n lines of s under a header (for the `info` flag).
+func dispShowTail(header, s string, n int) {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	fmt.Printf("\x1b[1;35m── %s (last %d) ──\x1b[0m\n", header, n)
+	for _, l := range lines {
+		if strings.TrimSpace(l) != "" {
+			fmt.Printf("  \x1b[2m%s\x1b[0m\n", l)
+		}
+	}
+}
+
 // dispComposeOut runs a compose command and captures stdout (trimmed).
 func dispComposeOut(file string, args ...string) string {
 	full := append([]string{"compose", "-f", file}, args...)
@@ -367,30 +473,42 @@ func dispUp(a dispArgs) {
 			fmt.Printf("\x1b[1;31m✘ Warning: Stack %s.yml not found, skipping…\x1b[0m\n", stack)
 			return
 		}
+		// Loading bar instead of raw Docker spam (mirrors the Python update_ui).
+		luiInit(stack, service)
 		if a.restart {
+			luiUpdate("Stopping current containers…", 5)
 			if service != "" {
-				dispCompose(file, "stop", service)
+				dispComposeQ(file, "stop", service)
 			} else {
-				dispCompose(file, "stop")
+				dispComposeQ(file, "stop")
 			}
 		}
-		fmt.Printf("\x1b[1;36m▶ Deploying %s%s\x1b[0m\n", stack, dispSvcLabel(service))
+		luiUpdate("Pulling images…", 20)
 		if service != "" {
-			dispCompose(file, "pull", "--ignore-pull-failures", service)
+			dispComposeQ(file, "pull", "--ignore-pull-failures", service)
+			luiUpdate("Creating containers…", 70)
 			args := append([]string{"up", "-d"}, extra...)
 			args = append(args, service)
-			dispCompose(file, args...)
+			dispComposeQ(file, args...)
 		} else {
-			dispCompose(file, "pull", "--ignore-pull-failures")
+			dispComposeQ(file, "pull", "--ignore-pull-failures")
+			luiUpdate("Creating containers…", 70)
 			args := append([]string{"up", "-d"}, extra...)
-			dispCompose(file, args...)
+			dispComposeQ(file, args...)
 		}
+		luiUpdate("Restarting Sablier…", 90)
 		dispSablierRestart()
-		// `up … fix` — run the full per-stack fix after it's deployed (mirrors
-		// bash running stacks_fix.py per stack when DO_FIX=1). This includes the
-		// name-sync phase, so names propagate into compose + dynamics.
+		upLog := luiLog.String() // grab before fix runs (for the `info` flag)
+		luiUpdate("Done", 100)
+		luiClear()
+		fmt.Printf("\x1b[1;32m✔ %s%s up\x1b[0m\n", stack, dispSvcLabel(service))
+		// `up … fix` — full per-stack fix after deploy (prints its own log).
 		if a.doFix {
 			cmdFix([]string{stack})
+		}
+		// `up … info` — show the last 20 lines of the up/pull log.
+		if a.info {
+			dispShowTail("up "+stack, upLog, 20)
 		}
 	}
 
