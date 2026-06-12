@@ -20,7 +20,11 @@ package lib
 // AUTO_DETECT_TRAEFIK + ZERO_SCALE_TRAEFIK_API.
 
 import (
+	"bufio"
+	"crypto/sha1"
+	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -414,6 +418,11 @@ func siteForHost(host string) (string, *zsSite) {
 // zsLandingHandler is what Traefik's errors-middleware hits when a site is asleep.
 // It starts the site's containers and serves the themeable loading screen.
 func zsLandingHandler(w http.ResponseWriter, r *http.Request) {
+	// the theme's live-log WebSocket connects to "/?session=…" — hand it off.
+	if strings.Contains(strings.ToLower(r.Header.Get("Upgrade")), "websocket") {
+		zsWSHandler(w, r)
+		return
+	}
 	cfg := configLoad()
 	key, s := siteForHost(r.Host)
 	if s == nil {
@@ -445,8 +454,9 @@ func zsLandingHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// fire the wake (start every container for the site)
-	for _, cn := range s.Containers {
+	// fire the wake for the WHOLE GROUP (the site's containers + auto-detected
+	// dependencies: its DB, redis, backend, etc.) so the app comes up working.
+	for _, cn := range siteGroup(s) {
 		if !containerRunning(cn) {
 			_ = exec.Command("docker", "start", cn).Start()
 		}
@@ -469,19 +479,8 @@ func zsLandingHandler(w http.ResponseWriter, r *http.Request) {
 func zsWakeStatusHandler(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("site")
 	c := loadZSConfig()
-	s := c.Sites[key]
-	requireHealth := configLoad()["ZERO_SCALE_HEALTHCHECK"] != "0"
-	up := false
-	if s != nil {
-		up = len(s.Containers) > 0
-		for _, cn := range s.Containers {
-			if !containerReady(cn, requireHealth) {
-				up = false
-			}
-		}
-	}
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"up": %v}`, up)
+	fmt.Fprintf(w, `{"up": %v}`, siteReady(c.Sites[key])) // whole group ready
 }
 
 // containerReady = running AND (no Docker healthcheck OR healthy). When
@@ -505,17 +504,8 @@ func containerReady(name string, requireHealth bool) bool {
 // screen reloads the user into the real app.
 func zsStatusHandler(w http.ResponseWriter, r *http.Request) {
 	_, s := siteForHost(r.URL.Query().Get("host"))
-	requireHealth := configLoad()["ZERO_SCALE_HEALTHCHECK"] != "0"
-	ready := s != nil && len(s.Containers) > 0
-	if s != nil {
-		for _, cn := range s.Containers {
-			if !containerReady(cn, requireHealth) {
-				ready = false
-			}
-		}
-	}
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"ready": %v}`, ready)
+	fmt.Fprintf(w, `{"ready": %v}`, siteReady(s)) // whole group must be ready
 }
 
 // zsLogsHandler streams the site container's docker logs as SSE for the screen.
@@ -700,6 +690,185 @@ func zeroScaleUninstall() {
 // loadingScreenHTML renders a self-contained, themed wake screen. It polls
 // /zs/wake until the site is up (then reloads so Traefik routes to the now-awake
 // service) and live-streams the container's Docker logs via /zs/logs (SSE).
+// ── container groups (auto-wake the whole dependency group) ───────────────────
+
+func dockerAllNames() []string {
+	out, _ := exec.Command("docker", "ps", "-a", "--format", "{{.Names}}").Output()
+	return strings.Fields(string(out))
+}
+func dockerEnvValues(name string) []string {
+	out, _ := exec.Command("docker", "inspect", "-f",
+		"{{range .Config.Env}}{{println .}}{{end}}", name).Output()
+	return strings.Split(string(out), "\n")
+}
+
+// zsAutoGroup expands a site's seed containers into its full GROUP, in real time
+// via the Docker API: the seed containers + the shared ZERO_SCALE_DEPENDS + any
+// OTHER container they reference in their env (its database, redis, backend, etc.
+// — e.g. DATABASE_URL=…@pgvectordb pulls in pgvectordb). Waking one wakes them all.
+func zsAutoGroup(seed []string) []string {
+	cfg := configLoad()
+	want := map[string]bool{}
+	for _, x := range seed {
+		if x != "" {
+			want[x] = true
+		}
+	}
+	if cfgBoolKey(cfg, "ZERO_SCALE_WAKE_DEPENDS", true) {
+		for _, d := range strings.Fields(cfg["ZERO_SCALE_DEPENDS"]) {
+			if d != "" {
+				want[d] = true
+			}
+		}
+		all := dockerAllNames()
+		for _, x := range seed {
+			for _, v := range dockerEnvValues(x) {
+				lv := strings.ToLower(v)
+				for _, other := range all {
+					if other != x && len(other) >= 4 && strings.Contains(lv, strings.ToLower(other)) {
+						want[other] = true
+					}
+				}
+			}
+		}
+	}
+	out := make([]string, 0, len(want))
+	for n := range want {
+		out = append(out, n)
+	}
+	return out
+}
+
+func siteGroup(s *zsSite) []string {
+	if s == nil {
+		return nil
+	}
+	return zsAutoGroup(s.Containers)
+}
+
+func siteReady(s *zsSite) bool {
+	requireHealth := configLoad()["ZERO_SCALE_HEALTHCHECK"] != "0"
+	g := siteGroup(s)
+	if len(g) == 0 {
+		return false
+	}
+	for _, cn := range g {
+		if !containerReady(cn, requireHealth) {
+			return false
+		}
+	}
+	return true
+}
+
+// ── minimal WebSocket (no external deps) for live group logs ──────────────────
+
+func wsAccept(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// wsWriteText writes one unmasked server text frame.
+func wsWriteText(conn net.Conn, msg string) error {
+	p := []byte(msg)
+	n := len(p)
+	hdr := []byte{0x81}
+	switch {
+	case n < 126:
+		hdr = append(hdr, byte(n))
+	case n < 65536:
+		hdr = append(hdr, 126, byte(n>>8), byte(n))
+	default:
+		hdr = append(hdr, 127, 0, 0, 0, 0, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
+	}
+	if _, err := conn.Write(hdr); err != nil {
+		return err
+	}
+	_, err := conn.Write(p)
+	return err
+}
+
+func wsClassify(ln string) string {
+	l := strings.ToLower(ln)
+	switch {
+	case strings.Contains(l, "error"), strings.Contains(l, "fatal"), strings.Contains(l, "panic"):
+		return "error"
+	case strings.Contains(l, "warn"):
+		return "warn"
+	case strings.Contains(l, "listening"), strings.Contains(l, "started"), strings.Contains(l, "ready"), strings.Contains(l, "running on"):
+		return "ok"
+	}
+	return ""
+}
+
+func streamContainerLogs(name string, out chan<- string, stop <-chan struct{}) {
+	cmd := exec.Command("docker", "logs", "-f", "--tail", "15", name)
+	pipe, err := cmd.StdoutPipe()
+	cmd.Stderr = cmd.Stdout
+	if err != nil || cmd.Start() != nil {
+		return
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+	sc := bufio.NewScanner(pipe)
+	for sc.Scan() {
+		select {
+		case out <- name + " | " + sc.Text():
+		case <-stop:
+			return
+		}
+	}
+}
+
+// zsWSHandler upgrades to WebSocket and streams the live Docker logs of every
+// container in the site's group (what the bellzloader theme's log box shows),
+// emitting a {type:"ready"} once the whole group is up so the page drops in.
+func zsWSHandler(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("Sec-WebSocket-Key")
+	hj, ok := w.(http.Hijacker)
+	if key == "" || !ok {
+		http.Error(w, "websocket only", http.StatusBadRequest)
+		return
+	}
+	conn, _, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" +
+		"Connection: Upgrade\r\nSec-WebSocket-Accept: " + wsAccept(key) + "\r\n\r\n"))
+
+	c := loadZSConfig()
+	s := c.Sites[r.URL.Query().Get("session")]
+	if s == nil {
+		return
+	}
+	group := siteGroup(s)
+	wsWriteText(conn, fmt.Sprintf(`{"text":"⛏ waking group: %s","type":"status"}`,
+		strings.Join(group, ", ")))
+	lines := make(chan string, 200)
+	stop := make(chan struct{})
+	defer close(stop)
+	for _, cn := range group {
+		go streamContainerLogs(cn, lines, stop)
+	}
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		select {
+		case ln := <-lines:
+			if wsWriteText(conn, fmt.Sprintf(`{"text":%q,"type":%q}`, ln, wsClassify(ln))) != nil {
+				return
+			}
+		case <-tick.C:
+			if siteReady(s) {
+				wsWriteText(conn, `{"text":"READY — entering…","type":"ready"}`)
+				return
+			}
+		}
+	}
+}
+
 func loadingScreenHTML(screen, display, siteKey, host string) string {
 	cfg := configLoad()
 	// First choice: serve the user's REAL theme .html files (identical to the old
