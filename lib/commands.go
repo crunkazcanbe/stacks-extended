@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -319,8 +320,31 @@ var (
 	luiAction  string
 	luiPercent int
 	luiStart   time.Time
-	luiLog     bytes.Buffer
+	luiLog     luiCapture
 )
+
+// luiCapture is a thread-safe io.Writer: docker writes to it concurrently while
+// the ticker reads Last() for the live action line — so no data race.
+type luiCapture struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	last string
+}
+
+func (c *luiCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.buf.Write(p)
+	for _, ln := range strings.Split(string(p), "\n") {
+		if t := strings.TrimSpace(ln); t != "" {
+			c.last = t
+		}
+	}
+	return len(p), nil
+}
+func (c *luiCapture) Last() string   { c.mu.Lock(); defer c.mu.Unlock(); return c.last }
+func (c *luiCapture) String() string { c.mu.Lock(); defer c.mu.Unlock(); return c.buf.String() }
+func (c *luiCapture) Reset()         { c.mu.Lock(); defer c.mu.Unlock(); c.buf.Reset(); c.last = "" }
 
 var luiSpin = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
@@ -388,7 +412,11 @@ func dispComposeQ(file string, args ...string) bool {
 		case err := <-done:
 			return err == nil
 		case <-tick.C:
-			luiUpdate(luiAction, luiPercent) // same action/percent, spinner advances
+			act := luiLog.Last() // live: the latest docker line (Container X Started…)
+			if act == "" {
+				act = luiAction
+			}
+			luiUpdate(act, luiPercent)
 		}
 	}
 }
@@ -405,6 +433,44 @@ func dispShowTail(header, s string, n int) {
 			fmt.Printf("  \x1b[2m%s\x1b[0m\n", l)
 		}
 	}
+}
+
+// dispCapturedFix runs the fix (or repair) engine for one stack behind the
+// loading bar, capturing its output so `info` can show it as a separate log.
+func dispCapturedFix(stack string, repair bool) string {
+	label, args := "Fixing", []string{"fix", stack}
+	if repair {
+		label, args = "Repairing", []string{"fix", stack, "repair"}
+	}
+	luiInit(stack, "")
+	luiUpdate(label+"…", 40)
+	cmd := exec.Command(selfExe(), args...)
+	cmd.Env = dockerEnv()
+	cmd.Stdout = &luiLog
+	cmd.Stderr = &luiLog
+	if cmd.Start() != nil {
+		luiClear()
+		return ""
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	tick := time.NewTicker(150 * time.Millisecond)
+	defer tick.Stop()
+	for running := true; running; {
+		select {
+		case <-done:
+			running = false
+		case <-tick.C:
+			act := luiLog.Last()
+			if act == "" {
+				act = label + "…"
+			}
+			luiUpdate(act, 70)
+		}
+	}
+	out := luiLog.String()
+	luiClear()
+	return out
 }
 
 // dispComposeOut runs a compose command and captures stdout (trimmed).
@@ -496,19 +562,26 @@ func dispUp(a dispArgs) {
 			args := append([]string{"up", "-d"}, extra...)
 			dispComposeQ(file, args...)
 		}
-		luiUpdate("Restarting Sablier…", 90)
-		dispSablierRestart()
-		upLog := luiLog.String() // grab before fix runs (for the `info` flag)
+		luiUpdate("Restarting Sablier…", 95)
 		luiUpdate("Done", 100)
-		luiClear()
+		upLog := luiLog.String() // captured for the `info` flag (incl. recreate)
+		luiClear()               // clear the bar BEFORE anything else prints (no garble)
+		dispSablierRestart()
 		fmt.Printf("\x1b[1;32m✔ %s%s up\x1b[0m\n", stack, dispSvcLabel(service))
-		// `up … fix` — full per-stack fix after deploy (prints its own log).
-		if a.doFix {
-			cmdFix([]string{stack})
+		// `up … fix`/`repair` — run after deploy; capture each so `info` can show
+		// them as SEPARATE logs (repair / up / recreate), like the Python version.
+		var repairLog string
+		if a.doFix || a.doRepair {
+			repairLog = dispCapturedFix(stack, a.doRepair)
 		}
-		// `up … info` — show the last 20 lines of the up/pull log.
 		if a.info {
+			if repairLog != "" {
+				dispShowTail("repair "+stack, repairLog, 20)
+			}
 			dispShowTail("up "+stack, upLog, 20)
+			if a.recreate {
+				dispShowTail("recreate "+stack, upLog, 20)
+			}
 		}
 	}
 
