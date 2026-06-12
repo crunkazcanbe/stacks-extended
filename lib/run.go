@@ -226,29 +226,48 @@ func cmdStatus(args []string) {
 
 func cmdLs(args []string) {
 	dir := stacksDir()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			fmt.Printf("📦 no stacks directory yet (%s)\n", dir)
-			fmt.Println("   nothing to list here. Set STACKS_DIR (or stacks_dir in stacks.conf)")
-			fmt.Println("   to point at your compose files — Docker commands (status/ls/inspect)")
-			fmt.Println("   work fine without it.")
-			return
+	fileStacks := map[string]bool{}
+	var stacks []string
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			n := e.Name()
+			if strings.HasSuffix(n, ".yml") && !strings.HasSuffix(n, "-ext.yml") {
+				name := strings.TrimSuffix(n, ".yml")
+				stacks = append(stacks, name)
+				fileStacks[name] = true
+			}
 		}
-		fmt.Println("cannot read", dir, ":", err)
+	}
+
+	// Also list any live compose project that has no .yml file here — found in
+	// the directory it actually lives in, straight from the Docker labels. So a
+	// stack with no configured STACKS_DIR still shows up (and its directory too).
+	liveDir := map[string]string{}
+	for _, ci := range containerInfo() {
+		p := ci.Project
+		if p == "" || fileStacks[p] {
+			continue
+		}
+		if _, ok := liveDir[p]; !ok {
+			stacks = append(stacks, p)
+			liveDir[p] = composeFileFromLabels(ci.Config, ci.WorkDir)
+		}
+	}
+
+	sort.Strings(stacks)
+	if len(stacks) == 0 {
+		fmt.Printf("📦 no stacks found (no compose files in %s, no running compose projects)\n", dir)
+		fmt.Println("   set STACKS_DIR in stacks.conf to point at your compose files, or just")
+		fmt.Println("   start some stacks — they'll be auto-detected from their Docker labels.")
 		return
 	}
-	var stacks []string
-	for _, e := range entries {
-		n := e.Name()
-		if strings.HasSuffix(n, ".yml") && !strings.HasSuffix(n, "-ext.yml") {
-			stacks = append(stacks, strings.TrimSuffix(n, ".yml"))
-		}
-	}
-	sort.Strings(stacks)
-	fmt.Printf("📦 %d stacks in %s:\n", len(stacks), dir)
+	fmt.Printf("📦 %d stacks:\n", len(stacks))
 	for _, s := range stacks {
-		fmt.Println("  \x1b[36m" + s + "\x1b[0m")
+		if d := liveDir[s]; d != "" {
+			fmt.Printf("  \x1b[36m%-22s\x1b[0m \x1b[90m%s\x1b[0m\n", s, d)
+		} else {
+			fmt.Println("  \x1b[36m" + s + "\x1b[0m")
+		}
 	}
 }
 

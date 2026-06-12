@@ -204,15 +204,16 @@ func tuiMemStats() map[string]string {
 
 // tuiScanStacks mirrors get_stacks(): one row per <name>.yml in stacksDir.
 func tuiScanStacks(info map[string]ctrInfo) []tuiStack {
-	dir := stacksDir()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
+	seen := map[string]bool{} // stack names already produced from a .yml file
+
+	// 1) File-backed stacks (the normal case on her home machine).
 	var names []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".yml") {
-			names = append(names, e.Name())
+	dir := stacksDir()
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".yml") {
+				names = append(names, e.Name())
+			}
 		}
 	}
 	sort.Strings(names)
@@ -250,8 +251,83 @@ func tuiScanStacks(info map[string]ctrInfo) []tuiStack {
 			Name: name, Running: running, Stopped: stopped, Total: total,
 			File: path, SizeKB: sizeKB, Images: images,
 		})
+		seen[name] = true
+	}
+
+	// 2) Live-only stacks: any compose project running on this machine that has
+	// NO .yml file here (e.g. on the VPS, or any container started outside the
+	// stacks dir). Derive the stack straight from the Docker compose labels so
+	// the Stacks tab is never blank just because we don't own the compose file.
+	type agg struct {
+		running, stopped int
+		images           map[string]bool
+		file             string // the stack's real compose file, from the labels
+	}
+	live := map[string]*agg{}
+	for _, ci := range info {
+		p := ci.Project
+		if p == "" || seen[p] {
+			continue
+		}
+		a := live[p]
+		if a == nil {
+			a = &agg{images: map[string]bool{}}
+			live[p] = a
+		}
+		if strings.EqualFold(ci.State, "running") {
+			a.running++
+		} else {
+			a.stopped++
+		}
+		if ci.Image != "" {
+			a.images[ci.Image] = true
+		}
+		if a.file == "" {
+			a.file = composeFileFromLabels(ci.Config, ci.WorkDir)
+		}
+	}
+	var liveNames []string
+	for p := range live {
+		liveNames = append(liveNames, p)
+	}
+	sort.Strings(liveNames)
+	for _, p := range liveNames {
+		a := live[p]
+		var images []string
+		for img := range a.images {
+			images = append(images, img)
+		}
+		sort.Strings(images)
+		var sizeKB int64
+		if a.file != "" {
+			if st, e := os.Stat(a.file); e == nil {
+				sizeKB = st.Size() / 1024
+			}
+		}
+		stacks = append(stacks, tuiStack{
+			Name: p, Running: a.running, Stopped: a.stopped,
+			Total: a.running + a.stopped, File: a.file, SizeKB: sizeKB, Images: images,
+		})
 	}
 	return stacks
+}
+
+// composeFileFromLabels resolves a stack's compose file from the Docker compose
+// labels: config_files may be comma-separated and relative to working_dir. We
+// take the first entry and make it absolute against the working dir. This is how
+// a stack with no configured STACKS_DIR is found in the directory it lives in.
+func composeFileFromLabels(configFiles, workDir string) string {
+	if configFiles == "" {
+		return ""
+	}
+	first := strings.TrimSpace(strings.Split(configFiles, ",")[0])
+	if first == "" {
+		return ""
+	}
+	if !filepath.IsAbs(first) && workDir != "" {
+		first = filepath.Join(workDir, first)
+	}
+	return first
 }
 
 // tuiHumanBytes renders a byte count like docker's image size column.
@@ -731,6 +807,7 @@ func tuiContains(fields []string, sub string) bool {
 
 // menuRun is the entry point invoked by cmdMenu.
 func menuRun() error {
+	ensureConf() // seed a default stacks.conf if none exists, so Settings is never blank
 	p := tea.NewProgram(menuModel{now: time.Now()}, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
@@ -2721,7 +2798,13 @@ func tuiLoadSettings() []tuiSetting {
 	var items []tuiSetting
 	data, err := os.ReadFile(tuiSettingsConf())
 	if err != nil {
-		return items
+		// No conf yet (fresh machine / VPS) — seed the embedded default so the
+		// Settings tab shows every option instead of being blank, then read it.
+		ensureConf()
+		data, err = os.ReadFile(tuiSettingsConf())
+		if err != nil {
+			return items
+		}
 	}
 	desc := ""
 	for _, raw := range strings.Split(string(data), "\n") {

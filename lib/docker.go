@@ -167,6 +167,8 @@ type ctrInfo struct {
 	Project string
 	Service string
 	Image   string
+	WorkDir string // com.docker.compose.project.working_dir — where the stack lives
+	Config  string // com.docker.compose.project.config_files — the compose file path(s)
 }
 
 // containerInfo mirrors container_info(): {name: {state,health,project,service,image}}.
@@ -180,18 +182,25 @@ func containerInfo() map[string]ctrInfo {
 				Project: d.Labels["com.docker.compose.project"],
 				Service: d.Labels["com.docker.compose.service"],
 				Image:   d.Image,
+				WorkDir: d.Labels["com.docker.compose.project.working_dir"],
+				Config:  d.Labels["com.docker.compose.project.config_files"],
 			}
 		}
 		return out
 	}
 	format := "{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Label \"com.docker.compose.project\"}}\t" +
-		"{{.Label \"com.docker.compose.service\"}}\t{{.Image}}"
+		"{{.Label \"com.docker.compose.service\"}}\t{{.Image}}\t" +
+		"{{.Label \"com.docker.compose.project.working_dir\"}}\t{{.Label \"com.docker.compose.project.config_files\"}}"
 	r := cli("ps", "-a", "--format", format)
 	for _, line := range strings.Split(r.stdout, "\n") {
 		p := strings.Split(line, "\t")
 		if len(p) >= 6 {
-			out[p[0]] = ctrInfo{State: p[1], Health: healthFromStatus(p[2]),
+			ci := ctrInfo{State: p[1], Health: healthFromStatus(p[2]),
 				Project: p[3], Service: p[4], Image: p[5]}
+			if len(p) >= 8 {
+				ci.WorkDir, ci.Config = p[6], p[7]
+			}
+			out[p[0]] = ci
 		}
 	}
 	return out
