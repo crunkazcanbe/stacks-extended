@@ -1271,6 +1271,26 @@ var scalarMap = map[string]string{
 	"tab_containers": "TAB_CONTAINERS", "tab_stacks": "TAB_STACKS", "tab_logs": "TAB_LOGS",
 	"tab_dynamics": "TAB_DYNAMICS", "tab_art": "TAB_ART", "tab_backup": "TAB_BACKUP",
 	"tab_network": "TAB_NETWORK", "tab_updates": "TAB_UPDATES", "tab_settings": "TAB_SETTINGS",
+	// ── controlled boot bring-up (stacks up --boot) ───────────────────────────
+	"boot_delay":            "BOOT_DELAY",            // seconds to wait after boot before starting
+	"up_parallel":           "UP_PARALLEL",           // how many stacks to start at once (default 3)
+	"start_strategy":        "START_STRATEGY",        // first pass: up | repair | recreate | fix
+	"boot_escalate":         "BOOT_ESCALATE",         // climb the escalation chain if unhealthy
+	"boot_force":            "BOOT_FORCE",            // run every step always (forced) vs only-if-needed
+	"boot_download_missing": "BOOT_DOWNLOAD_MISSING", // pre-pull images for non-boot stacks, keep stopped
+	"boot_override_docker":  "BOOT_OVERRIDE_DOCKER",  // disable Docker's own auto-start; we control startup
+	// ── watchdog (stacks watch) ───────────────────────────────────────────────
+	"watch_enabled":  "WATCH_ENABLED",  // run the 24/7 watchdog
+	"watch_interval": "WATCH_INTERVAL", // seconds between health sweeps (default 30)
+	"watch_strategy": "WATCH_STRATEGY", // what to do to a down service: up | repair | recreate | fix
+	"watch_escalate": "WATCH_ESCALATE", // climb the escalation chain if it stays unhealthy
+	"watch_force":    "WATCH_FORCE",    // always apply the chain vs only-if-needed
+	// ── auto-discovery (no reliance on STACKS_DIR) ────────────────────────────
+	"auto_detect_containers": "AUTO_DETECT_CONTAINERS", // show ALL running containers (Docker API), on by default
+	"auto_detect_stacks":     "AUTO_DETECT_STACKS",     // auto-find compose stacks (Docker API labels)
+	// ── Zero Scale ↔ Traefik integration ──────────────────────────────────────
+	"auto_detect_traefik":    "AUTO_DETECT_TRAEFIK",    // detect whether Traefik is running (Docker API)
+	"zero_scale_traefik_api": "ZERO_SCALE_TRAEFIK_API", // when Traefik is present, drive Zero Scale via its API
 }
 
 // LIST_MAP: friendly YAML list key -> (internal key, join char).
@@ -1286,6 +1306,11 @@ var listMap = map[string]listJoin{
 	"ip_whitelist":         {"IP_WHITELIST", ","}, "port_whitelist": {"PORT_WHITELIST", ","},
 	"proxy_skip": {"PROXY_SKIP_CONTAINERS", " "},
 	"scale_skip": {"SCALE_SKIP_CONTAINERS", " "},
+	// boot bring-up + watchdog selectable lists
+	"boot_stacks":      {"BOOT_STACKS", " "},      // what starts at boot (stack or stack/service)
+	"boot_escalation":  {"BOOT_ESCALATION", " "},  // ordered harder steps, e.g. recreate fix
+	"watch_stacks":     {"WATCH_STACKS", " "},     // what the watchdog keeps alive (blank = boot_stacks)
+	"watch_escalation": {"WATCH_ESCALATION", " "}, // ordered harder steps for the watchdog
 }
 
 // scalarStr mirrors _scalar(): bools become "1"/"0", everything else its string form.

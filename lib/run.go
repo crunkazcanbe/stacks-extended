@@ -60,7 +60,30 @@ func Run() {
 
 	// ── lifecycle + utility commands (dispatch.go) ────────────────────────────
 	case "up":
-		dispUp(dispParse(cmd, rest))
+		// `stacks up --boot` = the controlled, parallel, strategy-driven boot
+		// bring-up (boot.go) instead of a normal interactive up.
+		isBoot := false
+		filtered := rest[:0]
+		for _, r := range rest {
+			if r == "--boot" || r == "boot" {
+				isBoot = true
+				continue
+			}
+			filtered = append(filtered, r)
+		}
+		if isBoot {
+			runBoot()
+		} else {
+			dispUp(dispParse(cmd, filtered))
+		}
+	case "boot":
+		cmdBoot(rest) // boot.go — install/uninstall/status/run the boot+watchdog services
+	case "watch":
+		cmdWatch(rest) // boot.go — the 24/7 watchdog loop
+	case "install", "setup":
+		cmdBoot([]string{"install"}) // boot.go — install Docker (if missing) + boot/watchdog services
+	case "zeroscale", "zs", "wake":
+		cmdZeroScale(rest) // zeroscale.go — wake-on-visit engine (Sablier replacement)
 	case "down":
 		dispDown(dispParse(cmd, rest))
 	case "start", "stop", "restart":
