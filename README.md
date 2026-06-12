@@ -21,7 +21,7 @@ This is the **v3.0 Go rewrite**: the original was ~20k lines of Bash + Python sh
 ## Install
 
 ```sh
-go build -o stacks .
+go build -o stacks ./bin/stacks
 sudo cp stacks /usr/local/bin/
 stacks version
 ```
