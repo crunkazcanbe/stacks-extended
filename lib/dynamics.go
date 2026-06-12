@@ -1,4 +1,673 @@
-package main
+package lib
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// ===== from gendynamic.go =====
+
+// gendynamic.go — faithful Go port of stacks_gen_dynamic.py.
+// Auto-generates Traefik dynamic config files. Scans compose stacks and
+// generates routers, services, middlewares, TCP routes. Config-driven: reads
+// from stacks.conf / stacks.yaml for domains, URLs, feature flags.
+// Universal paths: stacksDir()/configDir()/home() — nothing machine-hardcoded.
+
+// ── Config defaults ──────────────────────────────────────────────────────────
+var genDynDefaults = map[string]string{
+	"PRIMARY_DOMAIN":   "loveiznothin.com",
+	"SECONDARY_DOMAIN": "bellzserver.cloud",
+	"AUTHENTIK_URL":    "http://authentik_server:9000",
+	"CROWDSEC_URL":     "http://crowdsec_bouncer:8080",
+	"SABLIER_URL":      "http://sablier:10000",
+	"SABLIER_THEME":    "ghost",
+	"SABLIER_DURATION": "1h",
+	"GEN_ROUTERS":      "1",
+	"GEN_SERVICES":     "1",
+	"GEN_MIDDLEWARES":  "1",
+	"GEN_SABLIER":      "1",
+	"GEN_TCP":          "1",
+	"GEN_AUTH":         "1",       // include authentik middleware (Authentik = the main gate)
+	"GEN_CROWDSEC":     "1",       // include crowdsec middleware
+	"GEN_DOMAIN":       "primary", // primary|secondary|both
+	// ── Security hardening (config-toggleable; safe defaults) ─────────────────
+	"GEN_PERMISSIONS_POLICY": "1", // add a Permissions-Policy response header (safe, pure addition)
+	"PERMISSIONS_POLICY":     "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()",
+	"GEN_CSP":                "0", // add Content-Security-Policy (OFF by default — CSP breaks many apps)
+	"CSP_POLICY":             "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' https: wss:; font-src 'self' data:; frame-ancestors 'self'",
+	"GEN_CF_IPALLOW":         "0", // restrict origin to Cloudflare + LAN IPs (OFF by default — can lock out access)
+	"CF_TRUSTED_IPS":         "",  // extra comma-separated CIDRs to always allow (e.g. your VPN subnet)
+}
+
+// Cloudflare published edge ranges (IPv4 + IPv6) + private LAN, used by the
+// optional cloudflare-ipallow middleware. Update from https://www.cloudflare.com/ips/
+var genDynCloudflareIPs = []string{
+	"173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+	"141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+	"197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+	"104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+	"2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+	"2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+}
+
+var genDynPrivateLANIPs = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1/32"}
+
+// TCP database port map. genDynTCPOrder preserves the Python dict iteration order
+// (matters for is_tcp_service / get_tcp_port first-match semantics).
+var genDynTCPOrder = []string{
+	"postgres", "postgresql", "mysql", "mariadb", "mongo", "mongodb",
+	"redis", "mssql", "neo4j",
+}
+var genDynTCPPorts = map[string]int{
+	"postgres": 5432, "postgresql": 5432,
+	"mysql": 3306, "mariadb": 3306,
+	"mongo": 27017, "mongodb": 27017,
+	"redis": 6379,
+	"mssql": 1433,
+	"neo4j": 7687,
+}
+
+// genDynPortMapOrder preserves Python dict order for image -> port defaults.
+var genDynPortMapOrder = []string{
+	"nginx", "apache", "caddy", "grafana", "prometheus", "gitea",
+	"nextcloud", "vaultwarden", "portainer",
+}
+var genDynPortMap = map[string]int{
+	"nginx": 80, "apache": 80, "caddy": 80,
+	"grafana": 3000, "prometheus": 9090,
+	"gitea": 3000, "nextcloud": 80,
+	"vaultwarden": 80, "portainer": 9000,
+}
+
+var genDynLBPortRe = regexp.MustCompile(`loadbalancer\.server\.port=(\d+)`)
+var genDynHostRuleRe = regexp.MustCompile("rule=Host\\(`([^.]+)\\.")
+
+// loadConf mirrors load_conf(): start with DEFAULTS, overlay stacks.conf
+// (KEY=VALUE), then overlay the YAML master (stacks.yaml wins) via configLoad().
+func genDynLoadConf() map[string]string {
+	cfg := map[string]string{}
+	for k, v := range genDynDefaults {
+		cfg[k] = v
+	}
+	confPath := filepath.Join(configDir(), "stacks.conf")
+	if data, err := os.ReadFile(confPath); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.Contains(line, "=") && !strings.HasPrefix(line, "#") {
+				k, v, _ := strings.Cut(line, "=")
+				cfg[strings.TrimSpace(k)] = strings.Trim(strings.Trim(strings.TrimSpace(v), `"`), `'`)
+			}
+		}
+	}
+	// YAML master overlay (stacks.yaml wins)
+	for k, v := range configLoad() {
+		cfg[k] = v
+	}
+	return cfg
+}
+
+// genDynLabelStrings normalizes a service's labels into a []string of "k=v"
+// (or the raw list entries), mirroring the Python isinstance(labels, dict) branch.
+func genDynLabelStrings(svc map[string]interface{}) []string {
+	raw, ok := svc["labels"]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch t := raw.(type) {
+	case map[string]interface{}:
+		var out []string
+		for k, v := range t {
+			out = append(out, fmt.Sprintf("%s=%s", k, genDynScalar(v)))
+		}
+		return out
+	case []interface{}:
+		var out []string
+		for _, x := range t {
+			out = append(out, genDynScalar(x))
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+// genDynScalar renders a YAML scalar the way Python's str()/f-string would for
+// labels (no "1"/"0" coercion — that's only for the config loader).
+func genDynScalar(v interface{}) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case bool:
+		if t {
+			return "True"
+		}
+		return "False"
+	default:
+		return fmt.Sprint(t)
+	}
+}
+
+func genDynStr(svc map[string]interface{}, key string) string {
+	if v, ok := svc[key]; ok && v != nil {
+		return genDynScalar(v)
+	}
+	return ""
+}
+
+// getServicePort: extract port from traefik label or common defaults.
+func genDynGetServicePort(svc map[string]interface{}) int {
+	for _, l := range genDynLabelStrings(svc) {
+		if m := genDynLBPortRe.FindStringSubmatch(l); m != nil {
+			if n, err := strconv.Atoi(m[1]); err == nil {
+				return n
+			}
+		}
+	}
+	image := strings.ToLower(genDynStr(svc, "image"))
+	for _, k := range genDynPortMapOrder {
+		if strings.Contains(image, k) {
+			return genDynPortMap[k]
+		}
+	}
+	return 80
+}
+
+// isTCPService: check if service is a TCP database.
+func genDynIsTCPService(name string, svc map[string]interface{}) bool {
+	nameLower := strings.ToLower(name)
+	for _, db := range genDynTCPOrder {
+		if strings.Contains(nameLower, db) {
+			return true
+		}
+	}
+	image := strings.ToLower(genDynStr(svc, "image"))
+	for _, db := range genDynTCPOrder {
+		if strings.Contains(image, db) {
+			return true
+		}
+	}
+	return false
+}
+
+// getTCPPort: returns (port, ok). ok=false mirrors Python returning None.
+func genDynGetTCPPort(name string, svc map[string]interface{}) (int, bool) {
+	nameLower := strings.ToLower(name)
+	for _, db := range genDynTCPOrder {
+		if strings.Contains(nameLower, db) {
+			return genDynTCPPorts[db], true
+		}
+	}
+	image := strings.ToLower(genDynStr(svc, "image"))
+	for _, db := range genDynTCPOrder {
+		if strings.Contains(image, db) {
+			return genDynTCPPorts[db], true
+		}
+	}
+	return 0, false
+}
+
+// serviceHasTraefik.
+func genDynServiceHasTraefik(svc map[string]interface{}) bool {
+	raw, ok := svc["labels"]
+	if ok && raw != nil {
+		if m, isMap := raw.(map[string]interface{}); isMap {
+			v := "false"
+			if x, ok := m["traefik.enable"]; ok {
+				v = genDynScalar(x)
+			}
+			return strings.ToLower(v) == "true"
+		}
+		if lst, isList := raw.([]interface{}); isList {
+			for _, l := range lst {
+				if strings.Contains(strings.ToLower(genDynScalar(l)), "traefik.enable=true") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// serviceSablierEnabled: False if explicitly sablier.enable=false (always-on,
+// never sleeps). Always-on services must NOT get a Sablier middleware.
+func genDynServiceSablierEnabled(svc map[string]interface{}) bool {
+	raw, ok := svc["labels"]
+	if ok && raw != nil {
+		if m, isMap := raw.(map[string]interface{}); isMap {
+			v := "true"
+			if x, ok := m["sablier.enable"]; ok {
+				v = genDynScalar(x)
+			}
+			return strings.ToLower(v) != "false"
+		}
+		if lst, isList := raw.([]interface{}); isList {
+			for _, l := range lst {
+				if strings.Contains(strings.ToLower(genDynScalar(l)), "sablier.enable=false") {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// getSubdomain: from traefik label or derive from name.
+func genDynGetSubdomain(name string, svc map[string]interface{}) string {
+	for _, l := range genDynLabelStrings(svc) {
+		if m := genDynHostRuleRe.FindStringSubmatch(l); m != nil {
+			return m[1]
+		}
+	}
+	cname := name
+	if c := genDynStr(svc, "container_name"); c != "" {
+		cname = c
+	}
+	return strings.ToLower(strings.ReplaceAll(cname, "_", "-"))
+}
+
+func genDynGenRouter(name, subdomain, domain, svcName, sablierMW string, cfg map[string]string) string {
+	var mws []string
+	if cfg["GEN_CF_IPALLOW"] == "1" {
+		mws = append(mws, "cloudflare-ipallow")
+	}
+	if sablierMW != "" {
+		mws = append(mws, sablierMW)
+	}
+	mws = append(mws, "https-header")
+	if cfg["GEN_CROWDSEC"] == "1" {
+		mws = append(mws, "crowdsec_bouncer")
+	}
+	if cfg["GEN_AUTH"] == "1" {
+		mws = append(mws, "authentik-auth")
+	}
+	mws = append(mws, "global-retry", "compress", "inflight", "buffering", "rate-limit")
+	mwStr := strings.Join(mws, ", ")
+	return fmt.Sprintf(
+		"    %s-router:\n"+
+			"      rule: \"Host(`%s.%s`)\"\n"+
+			"      service: %s\n"+
+			"      entryPoints: [web]\n"+
+			"      middlewares: [%s]\n",
+		name, subdomain, domain, svcName, mwStr)
+}
+
+func genDynGenService(name, container string, port int) string {
+	return fmt.Sprintf(
+		"    %s-svc:\n"+
+			"      loadBalancer:\n"+
+			"        servers: [{ url: \"http://%s:%d\" }]\n",
+		name, container, port)
+}
+
+func genDynGenSablierMW(name, container string, cfg map[string]string) string {
+	return fmt.Sprintf(
+		"    sablier-%s:\n"+
+			"      plugin:\n"+
+			"        sablier:\n"+
+			"          sablierUrl: \"%s\"\n"+
+			"          sessionDuration: \"%s\"\n"+
+			"          names: \"%s\"\n"+
+			"          dynamic:\n"+
+			"            displayName: \"%s\"\n"+
+			"            provider: \"docker\"\n"+
+			"            stopTimeout: \"30s\"\n"+
+			"            refreshFrequency: \"5s\"\n"+
+			"            theme: \"%s\"\n"+
+			"            timeout: \"10m\"\n"+
+			"            warmupPeriod: \"10s\"\n"+
+			"            healthCheckPath: \"/\"\n"+
+			"            healthCheckInterval: \"2s\"\n"+
+			"            scaling:\n"+
+			"              replicas: 1\n"+
+			"              minReplicas: 0\n"+
+			"              maxReplicas: 1\n",
+		name, cfg["SABLIER_URL"], cfg["SABLIER_DURATION"], container, container, cfg["SABLIER_THEME"])
+}
+
+func genDynGenTCPRouter(name, subdomain, domain string, port int) string {
+	return fmt.Sprintf(
+		"    %s-tcp:\n"+
+			"      rule: \"HostSNI(`%s.%s`)\"\n"+
+			"      entryPoints: [websecure]\n"+
+			"      service: %s-tcp-svc\n"+
+			"      tls:\n"+
+			"        passthrough: true\n",
+		name, subdomain, domain, name)
+}
+
+func genDynGenTCPService(name, container string, port int) string {
+	return fmt.Sprintf(
+		"    %s-tcp-svc:\n"+
+			"      loadBalancer:\n"+
+			"        servers:\n"+
+			"          - address: \"%s:%d\"\n",
+		name, container, port)
+}
+
+func genDynGenCloudflareIPAllow(cfg map[string]string) string {
+	var extra []string
+	for _, c := range strings.Split(cfg["CF_TRUSTED_IPS"], ",") {
+		if s := strings.TrimSpace(c); s != "" {
+			extra = append(extra, s)
+		}
+	}
+	var ranges []string
+	ranges = append(ranges, genDynCloudflareIPs...)
+	ranges = append(ranges, genDynPrivateLANIPs...)
+	ranges = append(ranges, extra...)
+	var lineParts []string
+	for _, r := range ranges {
+		lineParts = append(lineParts, fmt.Sprintf("          - \"%s\"", r))
+	}
+	lines := strings.Join(lineParts, "\n")
+	return "    cloudflare-ipallow:\n" +
+		"      ipAllowList:\n" +
+		"        sourceRange:\n" +
+		lines + "\n" +
+		"        ipStrategy:\n" +
+		"          depth: 1\n"
+}
+
+func genDynGenStandardMiddlewares(cfg map[string]string) string {
+	authURL := cfg["AUTHENTIK_URL"]
+	crowdsecURL := cfg["CROWDSEC_URL"]
+	extraHdrs := ""
+	if cfg["GEN_PERMISSIONS_POLICY"] == "1" {
+		extraHdrs += fmt.Sprintf("          Permissions-Policy: \"%s\"\n", cfg["PERMISSIONS_POLICY"])
+	}
+	if cfg["GEN_CSP"] == "1" {
+		extraHdrs += fmt.Sprintf("          Content-Security-Policy: \"%s\"\n", cfg["CSP_POLICY"])
+	}
+	out := "\n" +
+		"    https-header:\n" +
+		"      headers:\n" +
+		"        customRequestHeaders:\n" +
+		"          X-Forwarded-Proto: \"https\"\n" +
+		"        customResponseHeaders:\n" +
+		"          X-Frame-Options: \"SAMEORIGIN\"\n" +
+		"          X-Content-Type-Options: \"nosniff\"\n" +
+		"          X-XSS-Protection: \"1; mode=block\"\n" +
+		"          Referrer-Policy: \"strict-origin-when-cross-origin\"\n" +
+		"          Strict-Transport-Security: \"max-age=31536000; includeSubDomains; preload\"\n" +
+		"          Server: \"\"\n" +
+		"          X-Robots-Tag: \"noindex, nofollow\"\n" +
+		extraHdrs
+	if cfg["GEN_CF_IPALLOW"] == "1" {
+		out += "\n" + genDynGenCloudflareIPAllow(cfg) + "\n"
+	}
+	out += "\n" +
+		"\n" +
+		"    global-retry:\n" +
+		"      retry:\n" +
+		"        attempts: 3\n" +
+		"        initialInterval: 100ms\n" +
+		"\n" +
+		"    compress:\n" +
+		"      compress:\n" +
+		"        minResponseBodyBytes: 1024\n" +
+		"        encodings: [zstd, br, gzip]\n" +
+		"\n" +
+		"    inflight:\n" +
+		"      inFlightReq:\n" +
+		"        amount: 100\n" +
+		"        sourceCriterion:\n" +
+		"          ipStrategy: { depth: 1 }\n" +
+		"\n" +
+		"    buffering:\n" +
+		"      buffering:\n" +
+		"        maxRequestBodyBytes: 10485760\n" +
+		"        memRequestBodyBytes: 2097152\n" +
+		"        maxResponseBodyBytes: 10485760\n" +
+		"        memResponseBodyBytes: 2097152\n" +
+		"        retryExpression: \"IsNetworkError() && Attempts() < 3\"\n" +
+		"\n" +
+		"    rate-limit:\n" +
+		"      rateLimit:\n" +
+		"        average: 100\n" +
+		"        burst: 50\n" +
+		"        period: 1s\n" +
+		"        sourceCriterion:\n" +
+		"          ipStrategy: { depth: 1 }\n" +
+		"\n" +
+		fmt.Sprintf("    authentik-auth:\n"+
+			"      forwardAuth:\n"+
+			"        address: \"%s/outpost.goauthentik.io/auth/traefik\"\n"+
+			"        trustForwardHeader: true\n"+
+			"        authResponseHeaders:\n"+
+			"          - X-authentik-username\n"+
+			"          - X-authentik-groups\n"+
+			"          - X-authentik-email\n"+
+			"          - X-authentik-name\n"+
+			"          - X-authentik-uid\n"+
+			"          - X-authentik-jwt\n"+
+			"\n"+
+			"    crowdsec_bouncer:\n"+
+			"      forwardAuth:\n"+
+			"        address: \"%s/api/v1/forwardAuth\"\n"+
+			"        trustForwardHeader: true\n",
+			authURL, crowdsecURL)
+	return out
+}
+
+// generateDynamic: generate a dynamic config from a compose file.
+func genDynGenerateDynamic(stackPath, outPath string, cfg map[string]string) bool {
+	content, err := os.ReadFile(stackPath)
+	if err != nil {
+		fmt.Printf("  Parse error %s: %v\n", filepath.Base(stackPath), err)
+		return false
+	}
+	var data map[string]interface{}
+	if err := yaml.Unmarshal(content, &data); err != nil {
+		fmt.Printf("  Parse error %s: %v\n", filepath.Base(stackPath), err)
+		return false
+	}
+
+	servicesRaw, _ := data["services"].(map[string]interface{})
+	if len(servicesRaw) == 0 {
+		return false
+	}
+
+	domain := cfg["PRIMARY_DOMAIN"]
+
+	routersOut := ""
+	servicesOut := ""
+	middlewaresOut := ""
+	tcpRoutersOut := ""
+	tcpServicesOut := ""
+
+	// Preserve compose file service order. yaml.v3 into map[string]interface{}
+	// loses ordering, so re-read service keys in document order.
+	for _, svcName := range genDynServiceKeysInOrder(content) {
+		svcAny, ok := servicesRaw[svcName]
+		if !ok {
+			continue
+		}
+		svc, ok := svcAny.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		container := svcName
+		if c := genDynStr(svc, "container_name"); c != "" {
+			container = c
+		}
+
+		if genDynIsTCPService(svcName, svc) && cfg["GEN_TCP"] == "1" {
+			port, ok := genDynGetTCPPort(svcName, svc)
+			subdomain := strings.ToLower(strings.ReplaceAll(container, "_", "-"))
+			if ok {
+				tcpRoutersOut += genDynGenTCPRouter(svcName, subdomain, domain, port)
+				tcpServicesOut += genDynGenTCPService(svcName, container, port)
+			}
+			continue
+		}
+
+		if !genDynServiceHasTraefik(svc) {
+			continue
+		}
+
+		port := genDynGetServicePort(svc)
+		subdomain := genDynGetSubdomain(svcName, svc)
+		sablierMW := ""
+		if cfg["GEN_SABLIER"] == "1" && genDynServiceSablierEnabled(svc) {
+			sablierMW = "sablier-" + svcName
+		}
+
+		if cfg["GEN_ROUTERS"] == "1" {
+			routersOut += genDynGenRouter(svcName, subdomain, domain, svcName+"-svc", sablierMW, cfg)
+		}
+		if cfg["GEN_SERVICES"] == "1" {
+			servicesOut += genDynGenService(svcName, container, port)
+		}
+		if cfg["GEN_SABLIER"] == "1" && genDynServiceSablierEnabled(svc) {
+			middlewaresOut += genDynGenSablierMW(svcName, container, cfg)
+		}
+	}
+
+	if routersOut == "" && servicesOut == "" {
+		return false
+	}
+
+	out := "http:\n"
+	out += "  serversTransports:\n"
+	out += "    insecureTransport:\n"
+	out += "      insecureSkipVerify: true\n\n"
+
+	if routersOut != "" {
+		out += "  routers:\n\n" + routersOut + "\n"
+	}
+	if servicesOut != "" {
+		out += "  services:\n\n" + servicesOut + "\n"
+	}
+	if middlewaresOut != "" || cfg["GEN_MIDDLEWARES"] == "1" {
+		out += "  middlewares:\n"
+		if cfg["GEN_MIDDLEWARES"] == "1" {
+			out += genDynGenStandardMiddlewares(cfg)
+		}
+		if middlewaresOut != "" {
+			out += middlewaresOut
+		}
+	}
+
+	if tcpRoutersOut != "" {
+		out += "\ntcp:\n  routers:\n\n" + tcpRoutersOut
+		out += "\n  services:\n\n" + tcpServicesOut
+	}
+
+	if err := os.WriteFile(outPath, []byte(out), 0644); err != nil {
+		return false
+	}
+	return true
+}
+
+var genDynServiceKeyRe = regexp.MustCompile(`^  ([a-zA-Z0-9_.-]+):`)
+
+// genDynServiceKeysInOrder extracts service-block names in document order from a
+// compose file, so output ordering matches Python's dict iteration order.
+func genDynServiceKeysInOrder(content []byte) []string {
+	var keys []string
+	inServices := false
+	for _, line := range strings.Split(string(content), "\n") {
+		s := strings.TrimRight(line, "\r")
+		if strings.HasPrefix(s, "services:") {
+			inServices = true
+			continue
+		}
+		if inServices && len(s) > 0 && s[0] != ' ' && s[0] != '\t' && s[0] != '#' {
+			// new top-level key ends the services block
+			inServices = false
+			continue
+		}
+		if !inServices {
+			continue
+		}
+		if m := genDynServiceKeyRe.FindStringSubmatch(s); m != nil {
+			keys = append(keys, m[1])
+		}
+	}
+	return keys
+}
+
+// genDynMain mirrors main(): generate dynamic config(s) for one or all stacks.
+// target defaults to "all"; flags is the remaining argv (e.g. "--force").
+func genDynMain(args []string) {
+	cfg := genDynLoadConf()
+	stacksDirP := stacksDir()
+	if v := cfg["STACKS_DIR_OVERRIDE"]; v != "" {
+		stacksDirP = v
+	}
+	dynDir := filepath.Join(home(), "MyDocker", "Configs", "Dynamics")
+	if v := cfg["DYNAMICS_DIR_OVERRIDE"]; v != "" {
+		dynDir = v
+	}
+
+	target := "all"
+	if len(args) > 0 {
+		target = args[0]
+	}
+
+	// Stacks that run on a REMOTE host (VPS) — skip any '*-ext' stack during 'all'.
+	excludeSuffix := "-ext.yml"
+
+	var files []string
+	if target == "all" {
+		entries, _ := os.ReadDir(stacksDirP)
+		for _, e := range entries {
+			n := e.Name()
+			if strings.HasSuffix(n, ".yml") && !strings.HasSuffix(n, excludeSuffix) {
+				files = append(files, n)
+			}
+		}
+		sort.Strings(files)
+	} else {
+		if strings.HasSuffix(target, ".yml") {
+			files = []string{target}
+		} else {
+			files = []string{target + ".yml"}
+		}
+	}
+
+	force := false
+	for _, a := range args {
+		if a == "--force" {
+			force = true
+		}
+	}
+
+	generated := 0
+	for _, fname := range files {
+		stackPath := filepath.Join(stacksDirP, fname)
+		if _, err := os.Stat(stackPath); err != nil {
+			continue
+		}
+		outName := fname // same name in dynamics dir
+		outPath := filepath.Join(dynDir, outName)
+		// Don't overwrite existing unless --force
+		if _, err := os.Stat(outPath); err == nil && !force {
+			fmt.Printf("  skip (exists): %s\n", fname)
+			continue
+		}
+		if genDynGenerateDynamic(stackPath, outPath, cfg) {
+			fmt.Printf("  generated: %s\n", fname)
+			generated++
+		} else {
+			fmt.Printf("  skip (no traefik services): %s\n", fname)
+		}
+	}
+
+	fmt.Printf("\nGenerated %d dynamic config(s)\n", generated)
+}
+
+// ===== from gendynamic2.go =====
 
 // gendynamic2.go — faithful Go port of stacks_gen_dynamic2.py.
 //
@@ -12,19 +681,6 @@ package main
 // Universal paths: STACKS_DIR / DYNAMICS_DIR come from env (set by `stacks`) →
 // master config (stacks.yaml: stacks_folder / dynamics_folder) → generic default
 // derived from home(). No user identity is ever hardcoded.
-
-import (
-	"fmt"
-	"os"
-	"path/filepath"
-	"regexp"
-	"sort"
-	"strconv"
-	"strings"
-	"time"
-
-	"gopkg.in/yaml.v3"
-)
 
 // ── Paths: generic for any user ───────────────────────────────────────────────
 //
@@ -1918,4 +2574,998 @@ func gd2ReservePorts(ports []int) (bool, string) {
 // gd2NowUnix returns the current unix time (seconds) for the .bak suffix.
 func gd2NowUnix() int64 {
 	return time.Now().Unix()
+}
+
+// ===== from gengi.go =====
+
+// gengi.go — faithful Go port of stacks_gen_gi.py.
+//
+// Generates the global_inject.conf file: keys injected into every service by
+// `stacks fix`. Scans the stacks dir for unique alphabetic prefixes, assigns
+// CPU cores, and writes a fully-commented config template.
+
+// gengiPrefixRe matches a leading run of ASCII letters (Python: ^([a-zA-Z]+)).
+var gengiPrefixRe = regexp.MustCompile(`^([a-zA-Z]+)`)
+
+// gengiHeavyPrefixes mirrors the Python heavy_prefixes set.
+var gengiHeavyPrefixes = map[string]bool{"ai": true, "ml": true, "llm": true}
+
+// genGlobalInject is the Go equivalent of running stacks_gen_gi.py.
+//
+// confPath defaults to /tmp/global_inject.conf when empty.
+// stacksDirArg defaults to stacksDir() when empty (replacing the hardcoded
+// /home/bellzserver/MyDocker/Stacks default in the Python).
+func genGlobalInject(confPath, stacksDirArg string) error {
+	if confPath == "" {
+		confPath = "/tmp/global_inject.conf"
+	}
+	if stacksDirArg == "" {
+		stacksDirArg = stacksDir()
+	}
+
+	ncores := runtime.NumCPU()
+	if ncores == 0 {
+		ncores = 8
+	}
+
+	// Scan stacks dir for unique prefixes.
+	prefixSet := map[string]bool{}
+	if fi, err := os.Stat(stacksDirArg); err == nil && fi.IsDir() {
+		entries, err := os.ReadDir(stacksDirArg)
+		if err == nil {
+			for _, e := range entries {
+				f := e.Name()
+				if strings.HasSuffix(f, ".yml") || strings.HasSuffix(f, ".yaml") {
+					name := strings.ReplaceAll(f, ".yml", "")
+					name = strings.ReplaceAll(name, ".yaml", "")
+					if m := gengiPrefixRe.FindStringSubmatch(name); m != nil {
+						prefixSet[m[1]] = true
+					}
+				}
+			}
+		}
+	}
+
+	prefixes := make([]string, 0, len(prefixSet))
+	for p := range prefixSet {
+		prefixes = append(prefixes, p)
+	}
+	sort.Strings(prefixes)
+
+	usable := ncores / 2
+	if usable < 4 {
+		usable = 4
+	}
+
+	// Assign cores. Use an ordered slice of keys to preserve insertion order
+	// (Python dict preserves insertion order: regular prefixes first, then
+	// heavy prefixes appended).
+	coreMap := map[string]string{}
+	coreOrder := []string{}
+	regular := []string{}
+	for _, p := range prefixes {
+		if !gengiHeavyPrefixes[p] {
+			regular = append(regular, p)
+		}
+	}
+	for i, p := range regular {
+		if _, ok := coreMap[p]; !ok {
+			coreOrder = append(coreOrder, p)
+		}
+		coreMap[p] = fmt.Sprintf("%d", i%usable)
+	}
+	for _, p := range prefixes {
+		if gengiHeavyPrefixes[p] {
+			if _, ok := coreMap[p]; !ok {
+				coreOrder = append(coreOrder, p)
+			}
+			coreMap[p] = fmt.Sprintf("0-%d", ncores-1)
+		}
+	}
+
+	lines := []string{
+		"# ==============================================================================",
+		"# global_inject.conf — Keys injected into every service by stacks fix",
+		"# Auto-generated on first run. Edit freely.",
+		"# Values: 0=disabled, 1=add-only, force=always override",
+		"# _FORCE=1 forces individual key. FORCE_ALL=1 forces everything.",
+		"# Anchor keys -> x-common-caps block. Service keys -> each service.",
+		"# ==============================================================================",
+		"",
+		"FORCE_ALL=0",
+		"",
+		"# -- Stop behavior (-> anchor) ------------------------------------------------",
+		"INJECT_STOP_GRACE=1",
+		"INJECT_STOP_GRACE_FORCE=0",
+		"STOP_GRACE_PERIOD=120s",
+		"STOP_SIGNAL=SIGTERM",
+		"",
+		"# -- Logging (-> anchor) ------------------------------------------------------",
+		"INJECT_LOGGING=1",
+		"INJECT_LOGGING_FORCE=0",
+		"LOGGING_DRIVER=json-file",
+		"LOGGING_MAX_SIZE=50m",
+		"LOGGING_MAX_FILE=5",
+		"",
+		"# -- Restart policy (-> anchor) -----------------------------------------------",
+		"INJECT_RESTART=0",
+		"INJECT_RESTART_FORCE=0",
+		"RESTART_POLICY=unless-stopped",
+		"",
+		"# -- Resource limits (-> each service) ----------------------------------------",
+		"INJECT_DEPLOY=0",
+		"INJECT_DEPLOY_FORCE=0",
+		"DEPLOY_MEMORY_LIMIT=2G",
+		"DEPLOY_CPU_LIMIT=0.20",
+		"DEPLOY_MEMORY_RESERVATION=256M",
+		"",
+		"# -- Block IO (-> each service) -----------------------------------------------",
+		"INJECT_BLKIO=0",
+		"INJECT_BLKIO_FORCE=0",
+		"BLKIO_WEIGHT=500",
+		"BLKIO_READ_BPS=750mb",
+		"BLKIO_WRITE_BPS=750mb",
+		"",
+		"# -- ulimits (-> each service) ------------------------------------------------",
+		"INJECT_ULIMITS=0",
+		"INJECT_ULIMITS_FORCE=0",
+		"ULIMIT_NOFILE_SOFT=65535",
+		"ULIMIT_NOFILE_HARD=65535",
+		"ULIMIT_NPROC=65535",
+		"",
+		"# -- CPU core pinning (-> each service) --------------------------------------",
+		fmt.Sprintf("# Detected %d stack prefix(es): %s", len(prefixes), strings.Join(prefixes, ", ")),
+		fmt.Sprintf("# System has %d cores. Containers use 0-%d, host keeps %d-%d", ncores, usable-1, usable, ncores-1),
+		"INJECT_CPUSET=0",
+		"INJECT_CPUSET_FORCE=0",
+		"CPU_SHARES_default=256",
+		"CPU_SHARES_heavy=4096",
+		fmt.Sprintf("CPUSET_default=0-%d", usable-1),
+	}
+
+	for _, p := range coreOrder {
+		lines = append(lines, fmt.Sprintf("CPUSET_%s=%s", p, coreMap[p]))
+	}
+
+	lines = append(lines,
+		"# Container names that get all cores (space-separated)",
+		"CPUSET_heavy_containers=",
+		"",
+		"# -- Custom YAML injected into x-common-caps anchor --------------------------",
+		"[custom_anchor]",
+		"[/custom_anchor]",
+		"",
+		"# -- Custom YAML injected into every service ----------------------------------",
+		"[custom_service]",
+		"[/custom_service]",
+	)
+
+	if dir := filepath.Dir(confPath); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	if err := os.WriteFile(confPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		return err
+	}
+
+	fmt.Printf("Generated %s with %d prefixes: %s\n", confPath, len(prefixes), strings.Join(prefixes, ", "))
+	return nil
+}
+
+// ===== from gensrvs.go =====
+
+// gensrvs.go — faithful Go port of stacks_gen_srvs.py.
+// Writes <configDir>/all_services.txt: "stack | service | image" for every
+// service in every *.yml, grouped by stack. Universal paths (stacksDir/configDir).
+
+var (
+	reSrvServices = regexp.MustCompile(`^services:`)
+	reSrvFirstLet = regexp.MustCompile(`^[a-zA-Z]`)
+	reSrvKey      = regexp.MustCompile(`^  ([a-zA-Z0-9_.-]+):\s*$`)
+	reSrvImage    = regexp.MustCompile(`\s+image:\s+(.+)`)
+)
+
+// genServices mirrors stacks_gen_srvs.py: build all_services.txt.
+func genServices() {
+	stacksDirP := stacksDir()
+	out := filepath.Join(configDir(), "all_services.txt")
+
+	var lines []string
+	lines = append(lines, "# ALL SERVICES — BellzServer\n# Format: stack | service | image\n# "+
+		strings.Repeat("=", 41)+"\n\n")
+
+	entries, _ := os.ReadDir(stacksDirP)
+	var ymls []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".yml") {
+			ymls = append(ymls, e.Name())
+		}
+	}
+	sort.Strings(ymls)
+
+	total := 0
+	for _, yml := range ymls {
+		stack := strings.ReplaceAll(yml, ".yml", "")
+		lines = append(lines, "# ── "+strings.ToUpper(stack)+" "+strings.Repeat("─", 38)+"\n")
+		raw, err := os.ReadFile(filepath.Join(stacksDirP, yml))
+		if err != nil {
+			lines = append(lines, "\n")
+			continue
+		}
+		inServices := false
+		current := ""
+		image := ""
+		for _, line := range strings.Split(string(raw), "\n") {
+			s := strings.TrimRight(line, " \t\r\n\v\f")
+			if reSrvServices.MatchString(s) {
+				inServices = true
+				continue
+			}
+			if reSrvFirstLet.MatchString(s) && !strings.HasPrefix(s, " ") && inServices {
+				inServices = false
+				continue
+			}
+			if !inServices {
+				continue
+			}
+			if m := reSrvKey.FindStringSubmatch(s); m != nil {
+				if current != "" {
+					lines = append(lines, fmt.Sprintf("%-12s | %-35s | %s\n", stack, current, image))
+					total++
+				}
+				current = m[1]
+				image = ""
+				continue
+			}
+			if current != "" {
+				if im := reSrvImage.FindStringSubmatch(s); im != nil {
+					image = strings.TrimSpace(im[1])
+				}
+			}
+		}
+		if current != "" {
+			lines = append(lines, fmt.Sprintf("%-12s | %-35s | %s\n", stack, current, image))
+			total++
+		}
+		lines = append(lines, "\n")
+	}
+
+	os.WriteFile(out, []byte(strings.Join(lines, "")), 0644)
+	fmt.Printf("  \033[1;32m✔ %d services written to:\033[0m %s\n", total, out)
+}
+
+// ===== from fixdynamic.go =====
+
+// --- universal path helper (module-unique) ---------------------------------
+
+// fixdynDynDir resolves the Traefik dynamics directory generically for any user.
+// Priority: $DYNAMICS_DIR → conf DYNAMICS_DIR → $STACKS_DATA_DIR/Configs/Dynamics
+// → ~/MyDocker/Configs/Dynamics.
+func fixdynDynDir() string {
+	if d := os.Getenv("DYNAMICS_DIR"); d != "" {
+		return d
+	}
+	if d := confValue("DYNAMICS_DIR"); d != "" {
+		return d
+	}
+	if d := os.Getenv("STACKS_DATA_DIR"); d != "" {
+		return filepath.Join(d, "Configs", "Dynamics")
+	}
+	return filepath.Join(home(), "MyDocker", "Configs", "Dynamics")
+}
+
+// --- regexes (mirror the Python module-level compiles) ---------------------
+
+var (
+	fixdynIPRE    = regexp.MustCompile(`^\d{1,3}(\.\d{1,3}){3}$`)
+	fixdynURLRE   = regexp.MustCompile(`(url:\s*["']?https?://)([A-Za-z0-9_.\-]+)(:\d+)`)
+	fixdynNamesRE = regexp.MustCompile(`(names:\s*["'])([^"']+)(["'])`)
+)
+
+func fixdynNorm(name string) string {
+	r := strings.NewReplacer("-", "", "_", "", ".", "")
+	return strings.ToLower(r.Replace(name))
+}
+
+// fixdynBuildAuth returns (auth_set, norm_map) from every container_name in the
+// stacks. norm_map maps separator-stripped form -> sorted list of real names.
+func fixdynBuildAuth(stacksDir string) (map[string]bool, map[string][]string) {
+	auth := map[string]bool{}
+	cnRE := regexp.MustCompile(`container_name:\s*(\S+)`)
+	files, _ := filepath.Glob(filepath.Join(stacksDir, "*.yml"))
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		txt := string(data)
+		for _, m := range cnRE.FindAllStringSubmatch(txt, -1) {
+			cn := strings.Trim(strings.Trim(strings.TrimSpace(m[1]), `"`), `'`)
+			auth[cn] = true
+		}
+	}
+	normMap := map[string][]string{}
+	for a := range auth {
+		k := fixdynNorm(a)
+		normMap[k] = append(normMap[k], a)
+	}
+	for k := range normMap {
+		sort.Strings(normMap[k])
+	}
+	return auth, normMap
+}
+
+// fixdynResolve returns (status, value).
+// status: "ok" (already valid), "ip", "map" (value=new name),
+//
+//	"orphan" (no match), "ambiguous" (value=candidates joined by comma).
+func fixdynResolve(token string, auth map[string]bool, normMap map[string][]string) (string, string) {
+	if fixdynIPRE.MatchString(token) {
+		return "ip", token
+	}
+	if auth[token] {
+		return "ok", token
+	}
+	cands := normMap[fixdynNorm(token)]
+	if len(cands) == 1 && cands[0] != token {
+		return "map", cands[0]
+	}
+	if len(cands) > 1 {
+		return "ambiguous", strings.Join(cands, ",")
+	}
+	return "orphan", token
+}
+
+type fixdynChange struct{ kind, old, new string }
+type fixdynOrphan struct{ kind, token, detail string }
+
+// fixdynFixText returns (new_text, changes, orphans).
+func fixdynFixText(text string, auth map[string]bool, normMap map[string][]string) (string, []fixdynChange, []fixdynOrphan) {
+	var changes []fixdynChange
+	var orphans []fixdynOrphan
+
+	text = fixdynURLRE.ReplaceAllStringFunc(text, func(s string) string {
+		m := fixdynURLRE.FindStringSubmatch(s)
+		host := m[2]
+		st, val := fixdynResolve(host, auth, normMap)
+		if st == "map" {
+			changes = append(changes, fixdynChange{"url", host, val})
+			return m[1] + val + m[3]
+		}
+		if st == "orphan" {
+			orphans = append(orphans, fixdynOrphan{"url", host, "no container"})
+		} else if st == "ambiguous" {
+			orphans = append(orphans, fixdynOrphan{"url", host, "ambiguous: " + val})
+		}
+		return m[0]
+	})
+
+	text = fixdynNamesRE.ReplaceAllStringFunc(text, func(s string) string {
+		m := fixdynNamesRE.FindStringSubmatch(s)
+		toks := strings.Split(m[2], ",")
+		var out []string
+		for _, t := range toks {
+			t = strings.TrimSpace(t)
+			if t == "" {
+				continue
+			}
+			st, val := fixdynResolve(t, auth, normMap)
+			if st == "map" {
+				changes = append(changes, fixdynChange{"names", t, val})
+				out = append(out, val)
+			} else {
+				if st == "orphan" {
+					orphans = append(orphans, fixdynOrphan{"names", t, "no container"})
+				} else if st == "ambiguous" {
+					orphans = append(orphans, fixdynOrphan{"names", t, "ambiguous: " + val})
+				}
+				out = append(out, t)
+			}
+		}
+		return m[1] + strings.Join(out, ",") + m[3]
+	})
+
+	return text, changes, orphans
+}
+
+type fixdynResult struct {
+	path    string
+	err     string
+	changes []fixdynChange
+	orphans []fixdynOrphan
+	wrote   bool
+}
+
+func fixdynFixFile(path string, auth map[string]bool, normMap map[string][]string, dryRun bool) fixdynResult {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fixdynResult{path: path, err: err.Error()}
+	}
+	original := string(data)
+	newText, changes, orphans := fixdynFixText(original, auth, normMap)
+	wrote := false
+	if len(changes) > 0 && newText != original && !dryRun {
+		fixdynCopy2(path, fmt.Sprintf("%s.bak-dynfix-%d", path, time.Now().Unix()))
+		os.WriteFile(path, []byte(newText), 0644)
+		wrote = true
+	}
+	return fixdynResult{path: path, changes: changes, orphans: orphans, wrote: wrote}
+}
+
+// fixdynCopy2 mirrors shutil.copy2: copies contents and preserves mode/mtime.
+func fixdynCopy2(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	st, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, st.Mode())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	mt := st.ModTime()
+	return os.Chtimes(dst, mt, mt)
+}
+
+// fixdynFindTargets maps user tokens (stack names / dynamic stems / files) to
+// dynamic paths.
+func fixdynFindTargets(names []string, dynDir string) []string {
+	globbed, _ := filepath.Glob(filepath.Join(dynDir, "*.yml"))
+	sort.Strings(globbed)
+	var allf []string
+	for _, f := range globbed {
+		if !strings.Contains(filepath.Base(f), ".bak") {
+			allf = append(allf, f)
+		}
+	}
+	if len(names) == 0 || (len(names) == 1 && names[0] == "all") {
+		return allf
+	}
+	var out []string
+	for _, tok := range names {
+		b := filepath.Base(tok)
+		// exact file
+		cand := filepath.Join(dynDir, b)
+		if fixdynIsFile(cand) && !strings.Contains(b, ".bak") {
+			out = append(out, cand)
+			continue
+		}
+		// stack name (ai_0) or stem (ai0) -> <stem>-*.yml
+		stem := strings.ReplaceAll(strings.ReplaceAll(b, ".yml", ""), "_", "")
+		var m []string
+		for _, f := range allf {
+			if strings.SplitN(filepath.Base(f), "-", 2)[0] == stem {
+				m = append(m, f)
+			}
+		}
+		if len(m) > 0 {
+			out = append(out, m...)
+		} else {
+			fmt.Fprintf(os.Stderr, "  no dynamic for '%s'\n", tok)
+		}
+	}
+	// de-dup preserve order
+	seen := map[string]bool{}
+	var uniq []string
+	for _, f := range out {
+		if !seen[f] {
+			seen[f] = true
+			uniq = append(uniq, f)
+		}
+	}
+	return uniq
+}
+
+func fixdynIsFile(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+// fixDynamicMain is the faithful port of stacks_fix_dynamic.main(argv).
+func fixDynamicMain(argv []string) int {
+	stacksDir := stacksDir()
+	dynDir := fixdynDynDir()
+	dry := inList(argv, "--dry-run")
+	var names []string
+	for _, a := range argv {
+		if !strings.HasPrefix(a, "--") {
+			names = append(names, a)
+		}
+	}
+
+	auth, normMap := fixdynBuildAuth(stacksDir)
+	if len(auth) == 0 {
+		fmt.Printf("  \033[1;31m✘ no container_name found in %s\033[0m\n", stacksDir)
+		return 1
+	}
+	targets := fixdynFindTargets(names, dynDir)
+	if len(targets) == 0 {
+		fmt.Println("  no matching dynamic files")
+		return 0
+	}
+
+	tag := ""
+	if dry {
+		tag = "[dry-run] "
+	}
+	totalCh := 0
+	var orphanLines []string
+	for _, path := range targets {
+		r := fixdynFixFile(path, auth, normMap, dry)
+		b := filepath.Base(path)
+		if r.err != "" {
+			fmt.Printf("  \033[1;31m✘ %s: %s\033[0m\n", b, r.err)
+			continue
+		}
+		if len(r.changes) > 0 {
+			totalCh += len(r.changes)
+			// verb is "would fix" when dry, otherwise "fixed" regardless of wrote.
+			verb := "fixed"
+			if dry {
+				verb = "would fix"
+			}
+			fmt.Printf("  \033[1;32m✔ %s%s %s (%d)\033[0m\n", tag, verb, b, len(r.changes))
+			for _, c := range r.changes {
+				fmt.Printf("      %-6s %s -> %s\n", c.kind, c.old, c.new)
+			}
+		}
+		for _, o := range r.orphans {
+			orphanLines = append(orphanLines,
+				fmt.Sprintf("  \033[1;33m⚠ %-22s %-6s %s (%s)\033[0m", b, o.kind, o.token, o.detail))
+		}
+	}
+
+	if len(orphanLines) > 0 {
+		fmt.Println("\n\033[1;33m── Orphans / unresolved (left untouched, review manually) ──\033[0m")
+		for _, ln := range orphanLines {
+			fmt.Println(ln)
+		}
+	}
+
+	fmt.Printf("\n\033[1;36m%sTotal name fixes: %d across %d file(s); %d orphan ref(s)\033[0m\n",
+		tag, totalCh, len(targets), len(orphanLines))
+	return 0
+}
+
+// ===== from injectdynamic.go =====
+
+// injectdynamic.go — faithful Go port of stacks_inject_dynamic.py.
+//
+// CLI usage (matches the Python):
+//   stacks-inject-dynamic <action> <target> [dyn_dir]
+//     action   = "inject" | "strip"
+//     target   = "all" / "--all" / a path / a basename (with or without .yml)
+//     dyn_dir  = optional override for the Dynamics directory
+//
+// Injects/strips header & footer ASCII art (from art.conf) around dynamic
+// Traefik config files.
+
+// injectDynArt holds the header/footer art loaded from art.conf.
+type injectDynArt struct {
+	header string
+	footer string
+}
+
+// injectDynConfPath resolves the path to art.conf. The Python hardcoded
+// /home/loveiznothin/.config/stacks/art.conf — replaced with configDir().
+func injectDynConfPath() string {
+	return filepath.Join(configDir(), "art.conf")
+}
+
+// injectDynDefaultDir resolves the default Dynamics directory. The Python
+// hardcoded /home/bellzserver/MyDocker/Configs/Dynamics — replaced with a
+// universal path under the stacks data root (sibling Configs/Dynamics).
+func injectDynDefaultDir() string {
+	if d := os.Getenv("STACKS_DYNAMICS_DIR"); d != "" {
+		return d
+	}
+	// stacksDir() is .../MyDocker/Stacks; Dynamics lives at .../MyDocker/Configs/Dynamics
+	myDocker := filepath.Dir(stacksDir())
+	return filepath.Join(myDocker, "Configs", "Dynamics")
+}
+
+// injectDynLoadArt loads header/footer art from art.conf, faithfully mirroring
+// the BELLZART_START_/END_ marker parsing in the Python.
+func injectDynLoadArt(confPath string) injectDynArt {
+	var art injectDynArt
+	data, err := os.ReadFile(confPath)
+	if err != nil {
+		return art
+	}
+	conf := string(data)
+	pairs := []struct {
+		key string // "header" / "footer"
+	}{
+		{"header"},
+		{"footer"},
+	}
+	for _, p := range pairs {
+		key := p.key
+		sm := "##BELLZART_START_" + strings.ToUpper(key)
+		em := "##BELLZART_END_" + strings.ToUpper(key)
+		if strings.Contains(conf, sm) && strings.Contains(conf, em) {
+			// Faithful to Python: conf.split(sm)[1].split(em)[0].strip("\n")
+			// Python's str.split(sm)[1] is the chunk between the FIRST and
+			// SECOND occurrence of sm (or after the first if sm occurs once);
+			// then .split(em)[0] is everything before the first em in it.
+			afterStart := strings.Split(conf, sm)[1]
+			between := strings.Split(afterStart, em)[0]
+			between = strings.Trim(between, "\n")
+			if key == "header" {
+				art.header = between
+			} else {
+				art.footer = between
+			}
+		}
+	}
+	return art
+}
+
+// injectDynStripFile removes the leading and trailing comment blocks from a
+// file (faithful port of strip_file).
+func injectDynStripFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lines := injectDynReadlines(string(data))
+
+	// Remove leading comment block.
+	start := 0
+	for i, l := range lines {
+		if !strings.HasPrefix(l, "#") && strings.TrimSpace(l) != "" {
+			start = i
+			break
+		}
+	}
+	// Remove trailing comment block.
+	end := len(lines)
+	for i := len(lines) - 1; i >= 0; i-- {
+		if !strings.HasPrefix(lines[i], "#") && strings.TrimSpace(lines[i]) != "" {
+			end = i + 1
+			break
+		}
+	}
+	if start > len(lines) {
+		start = len(lines)
+	}
+	if end < start {
+		end = start
+	}
+	result := lines[start:end]
+	return os.WriteFile(path, []byte(strings.Join(result, "")), 0o644)
+}
+
+// injectDynInjectFile strips then prepends header art and appends footer art
+// (faithful port of inject_file).
+func injectDynInjectFile(path string, art injectDynArt) error {
+	if err := injectDynStripFile(path); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	content := string(data)
+	result := ""
+	if art.header != "" {
+		result += art.header + "\n"
+	}
+	result += content
+	if art.footer != "" {
+		result = strings.TrimRight(result, "\n") + "\n" + art.footer + "\n"
+	}
+	return os.WriteFile(path, []byte(result), 0o644)
+}
+
+// injectDynReadlines mimics Python's file.readlines(): it splits keeping the
+// trailing "\n" on each line, so re-joining is loss-less.
+func injectDynReadlines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var lines []string
+	for {
+		idx := strings.IndexByte(s, '\n')
+		if idx < 0 {
+			lines = append(lines, s)
+			break
+		}
+		lines = append(lines, s[:idx+1])
+		s = s[idx+1:]
+	}
+	return lines
+}
+
+// isFile reports whether path exists and is a regular file.
+func injectDynIsFile(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}
+
+// runInjectDynamic is the entry point equivalent to the Python __main__ body.
+// args are the positional arguments after the program name:
+//
+//	args[0] = action, args[1] = target, args[2] = dyn_dir (optional)
+func runInjectDynamic(args []string) int {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: inject-dynamic <inject|strip> <target> [dyn_dir]")
+		return 1
+	}
+	action := args[0] // inject or strip
+	target := args[1] // all or specific file
+	dynDir := injectDynDefaultDir()
+	if len(args) > 2 && args[2] != "" {
+		dynDir = args[2]
+	}
+
+	art := injectDynLoadArt(injectDynConfPath())
+
+	// Build file list.
+	var files []string
+	switch {
+	case target == "all" || target == "--all":
+		entries, err := os.ReadDir(dynDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Not found: %s\n", target)
+			return 1
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if strings.HasSuffix(name, ".yml") || strings.HasSuffix(name, ".yaml") {
+				files = append(files, filepath.Join(dynDir, name))
+			}
+		}
+	case filepath.IsAbs(target) && injectDynIsFile(target):
+		files = []string{target}
+	case injectDynIsFile(filepath.Join(dynDir, target)):
+		files = []string{filepath.Join(dynDir, target)}
+	case injectDynIsFile(filepath.Join(dynDir, target+".yml")):
+		files = []string{filepath.Join(dynDir, target+".yml")}
+	default:
+		fmt.Fprintf(os.Stderr, "Not found: %s\n", target)
+		return 1
+	}
+
+	for _, f := range files {
+		var err error
+		if action == "strip" {
+			err = injectDynStripFile(f)
+		} else {
+			err = injectDynInjectFile(f, art)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error processing %s: %v\n", f, err)
+			return 1
+		}
+		fmt.Println(filepath.Base(f))
+	}
+	return 0
+}
+
+// ===== from repairdynamic.go =====
+
+// repairdynamic.go — faithful Go port of stacks_repair_dynamic.py.
+//
+// Repair Traefik dynamic config files. Learned from ai_0.yml dynamic
+// (perfect reference).
+
+// STANDARD_MIDDLEWARES — every router should have these middlewares.
+var repairStandardMiddlewares = []string{
+	"https-header",
+	"crowdsec-bouncer",
+	"global-retry",
+	"compress",
+	"inflight",
+	"buffering",
+	"rate-limit",
+}
+
+const (
+	repairSablierURL  = "http://sablier:10000"
+	repairEntryPoints = "[web]"
+)
+
+// repairDynamicsDir resolves the default Dynamics directory generically.
+// The Python hardcodes /home/bellzserver/MyDocker/Configs/Dynamics; here we
+// derive it from the MyDocker root (the parent of stacksDir(), which is
+// .../MyDocker/Stacks) so it honours STACKS_DIR / STACKS_DATA_DIR overrides,
+// falling back to ~/MyDocker/Configs/Dynamics.
+func repairDynamicsDir() string {
+	myDocker := filepath.Dir(stacksDir())
+	if myDocker == "" || myDocker == "." || myDocker == string(filepath.Separator) {
+		myDocker = filepath.Join(home(), "MyDocker")
+	}
+	return filepath.Join(myDocker, "Configs", "Dynamics")
+}
+
+// repairDynamic repairs a single dynamic config file. Returns the list of fixes.
+func repairDynamic(path string, dryRun bool) ([]string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	content := string(raw)
+	original := content
+	var fixes []string
+
+	var f []string
+	content, f = repairFixSablierURL(content)
+	fixes = append(fixes, f...)
+
+	content, f = repairFixEntryPoints(content)
+	fixes = append(fixes, f...)
+
+	content, f = repairFixIndentation(content)
+	fixes = append(fixes, f...)
+
+	content, f = repairFixMissingMiddlewares(content)
+	fixes = append(fixes, f...)
+
+	if !dryRun && content != original {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			return fixes, err
+		}
+	}
+
+	return fixes, nil
+}
+
+var repairSablierRe = regexp.MustCompile(`sablierUrl:\s*"([^"]+)"`)
+
+// repairFixSablierURL fixes wrong sablierUrl values.
+func repairFixSablierURL(content string) (string, []string) {
+	var fixes []string
+	out := repairSablierRe.ReplaceAllStringFunc(content, func(m string) string {
+		sub := repairSablierRe.FindStringSubmatch(m)
+		if sub[1] != repairSablierURL {
+			fixes = append(fixes, fmt.Sprintf("sablier_url: fixed to %s", repairSablierURL))
+			return fmt.Sprintf("sablierUrl: \"%s\"", repairSablierURL)
+		}
+		return m
+	})
+	return out, fixes
+}
+
+var repairEntryPointsRe = regexp.MustCompile(`entryPoints:\s*(\[.*?\])`)
+
+// repairFixEntryPoints fixes entryPoints format.
+func repairFixEntryPoints(content string) (string, []string) {
+	var fixes []string
+	out := repairEntryPointsRe.ReplaceAllStringFunc(content, func(m string) string {
+		sub := repairEntryPointsRe.FindStringSubmatch(m)
+		val := strings.TrimSpace(sub[1])
+		if val != repairEntryPoints {
+			fixes = append(fixes, fmt.Sprintf("entryPoints: fixed to %s", repairEntryPoints))
+			return fmt.Sprintf("entryPoints: %s", repairEntryPoints)
+		}
+		return m
+	})
+	return out, fixes
+}
+
+// repairFixIndentation fixes common indentation issues - ensure 2-space indent.
+// (Mirrors the Python: conservative — it computes candidate fixes but never
+// applies them, so it returns the content unchanged with no fixes.)
+func repairFixIndentation(content string) (string, []string) {
+	var fixes []string
+	lines := strings.Split(content, "\n")
+	result := make([]string, 0, len(lines))
+	for _, line := range lines {
+		// Fix 4-space indent to 2-space (only for non-art lines)
+		if !strings.HasPrefix(line, "#") && !strings.Contains(line, "🌸") {
+			stripped := strings.TrimLeft(line, " ")
+			spaces := len(line) - len(stripped)
+			if spaces > 0 && spaces%4 == 0 && spaces%2 == 0 {
+				// Check if this looks like 4-space indented YAML
+				newSpaces := spaces / 2
+				newLine := strings.Repeat(" ", newSpaces) + stripped
+				if newLine != line {
+					// Only fix if it makes the file more consistent
+					// Conservative - don't auto-fix indentation blindly
+					_ = newLine
+				}
+			}
+		}
+		result = append(result, line)
+	}
+	return strings.Join(result, "\n"), fixes
+}
+
+var repairRouterRe = regexp.MustCompile(`(?s)(\w+-router):\s*\n.*?middlewares:\s*\[([^\]]+)\]`)
+
+// repairFixMissingMiddlewares checks routers are missing standard middlewares and warns.
+func repairFixMissingMiddlewares(content string) (string, []string) {
+	var fixes []string
+	matches := repairRouterRe.FindAllStringSubmatch(content, -1)
+	for _, mm := range matches {
+		routerName := mm[1]
+		mwStr := mm[2]
+		var middlewares []string
+		for _, m := range strings.Split(mwStr, ",") {
+			middlewares = append(middlewares, strings.TrimSpace(m))
+		}
+		for _, std := range repairStandardMiddlewares {
+			if !inList(middlewares, std) {
+				fixes = append(fixes, fmt.Sprintf("missing_middleware: %s missing %s", routerName, std))
+			}
+		}
+	}
+	return content, fixes
+}
+
+// repairScanAll scans every dynamic file in a directory and repairs each.
+func repairScanAll(dynamicsDir string, dryRun bool) error {
+	entries, err := os.ReadDir(dynamicsDir)
+	if err != nil {
+		return err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+
+	total := 0
+	for _, fname := range names {
+		if !strings.HasSuffix(fname, ".yml") && !strings.HasSuffix(fname, ".yaml") {
+			continue
+		}
+		path := filepath.Join(dynamicsDir, fname)
+		fixes, err := repairDynamic(path, dryRun)
+		if err != nil {
+			continue
+		}
+		if len(fixes) > 0 {
+			prefix := ""
+			if dryRun {
+				prefix = "[dry-run] "
+			}
+			fmt.Printf("%sFixed %s:\n", prefix, fname)
+			for _, f := range fixes {
+				fmt.Printf("  - %s\n", f)
+			}
+			total += len(fixes)
+		}
+	}
+	fmt.Printf("\nTotal fixes: %d\n", total)
+	return nil
+}
+
+// repairDynamicMain is the entry point mirroring the Python __main__ block.
+func repairDynamicMain(args []string) {
+	target := repairDynamicsDir()
+	if len(args) > 0 {
+		target = args[0]
+	}
+	dryRun := inList(args, "--dry-run")
+
+	info, err := os.Stat(target)
+	if err == nil && !info.IsDir() {
+		fixes, ferr := repairDynamic(target, dryRun)
+		if ferr != nil {
+			fmt.Println(ferr)
+			return
+		}
+		for _, f := range fixes {
+			fmt.Printf("  - %s\n", f)
+		}
+		fmt.Printf("Total: %d\n", len(fixes))
+	} else {
+		if err := repairScanAll(target, dryRun); err != nil {
+			fmt.Println(err)
+		}
+	}
 }

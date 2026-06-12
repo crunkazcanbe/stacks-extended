@@ -1,4 +1,21 @@
-package main
+package lib
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// ===== from dispatch.go =====
 
 // dispatch.go — the lifecycle + utility command implementations the bash
 // `stacks` dispatcher had inline that the Go port was still missing:
@@ -16,20 +33,6 @@ package main
 // flags / target-stack+service parsing the bash used.
 //
 // All new top-level helpers are prefixed `disp` to avoid collisions.
-
-import (
-	"bufio"
-	"fmt"
-	"io"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
-	"sort"
-	"strconv"
-	"strings"
-	"time"
-)
 
 // ── universal path helpers ───────────────────────────────────────────────────
 
@@ -142,18 +145,18 @@ func dispReversed(in []string) []string {
 // ── parsed-args model (a faithful subset of the bash arg parser) ─────────────
 
 type dispArgs struct {
-	command  string
-	recreate bool
-	restart  bool
-	force    bool
-	clean    bool
-	info     bool
-	doFix      bool // `… fix`      — run `stacks fix <stack>` after the lifecycle op
-	doDynamics bool // `… dynamics` — reconcile/generate dynamics alongside the op
-	doRepair   bool // `… repair`   — run dynamics repair (structural) too
-	stacks   []string // parsed stack tokens (resolved names)
-	services []string // parallel: service for each stack ("" = whole stack)
-	raw      []string // leftover non-flag args (TARGET_ARGS equivalent)
+	command    string
+	recreate   bool
+	restart    bool
+	force      bool
+	clean      bool
+	info       bool
+	doFix      bool     // `… fix`      — run `stacks fix <stack>` after the lifecycle op
+	doDynamics bool     // `… dynamics` — reconcile/generate dynamics alongside the op
+	doRepair   bool     // `… repair`   — run dynamics repair (structural) too
+	stacks     []string // parsed stack tokens (resolved names)
+	services   []string // parallel: service for each stack ("" = whole stack)
+	raw        []string // leftover non-flag args (TARGET_ARGS equivalent)
 }
 
 // dispParse builds a dispArgs from the command + the rest of argv. It separates
@@ -1887,4 +1890,685 @@ func dispFinalSummary() {
 	fmt.Printf("\x1b[1;36m│\x1b[0m  \x1b[1;31mInactive Containers:\x1b[0m %d\n", total-running)
 	fmt.Println("\x1b[1;36m└──────────────────────────────────────────────────────┘\x1b[0m")
 	fmt.Println("\n\x1b[1;32m✨ SEQUENCE COMPLETE ✨\x1b[0m")
+}
+
+// ===== from dispatch_bridge.go =====
+
+// dispatch_bridge.go — thin adapters that wire the dispatch.go lifecycle
+// commands to the already-ported engines (generators, dynamics fix/repair,
+// inject, describe). Kept separate so the bridge targets are obvious and a
+// single line retargets each if a ported symbol is ever renamed.
+
+// dispGen2 → the rich config-driven dynamics generator (gendynamic2.go).
+func dispGen2(args []string) { gendynamic2Main(args) }
+
+// dispGen1 → the legacy dynamics generator (gendynamic.go).
+func dispGen1(args []string) { genDynMain(args) }
+
+// dispDynFix → dynamic-name reconcile (fixdynamic.go). It takes the same
+// target list run_dynamics_fix passed to stacks_fix_dynamic.py.
+func dispDynFix(names []string) { fixDynamicMain(names) }
+
+// dispDynRepair → structural dynamics repair (repairdynamic.go). The bash ran
+// the repair lib per resolved dynamic file; repairDynamicMain handles the
+// target/all resolution itself.
+func dispDynRepair(names []string) { repairDynamicMain(names) }
+
+// dispInjectFile applies inject/strip/inject_urls to ONE stack file by routing
+// through the ported inject engine (inject.go cmdInject), which resolves the
+// file + reads art.conf the same way the bash did.
+//
+//	action: "inject" | "strip" | "inject_urls"
+//	mode  : "all" | "art" | "urls" | "desc"
+func dispInjectFile(action, file, mode string) {
+	switch action {
+	case "inject_urls":
+		cmdInject([]string{"inject", file, "urls"})
+	default:
+		cmdInject([]string{action, file, mode})
+	}
+}
+
+// dispInjectAll runs inject/strip across the whole stacks dir (or one target)
+// via the ported engine.
+func dispInjectAll(action, target string) {
+	cmdInject([]string{action, target})
+}
+
+// dispDescribeFile adds (or strips) service descriptions for ONE file via the
+// ported describe engine (describe.go describeMain).
+//
+//	action: "" for inject-descriptions, "strip" to remove them.
+func dispDescribeFile(action, file string) {
+	if action == "strip" {
+		describeMain([]string{"strip", file})
+		return
+	}
+	describeMain([]string{file})
+}
+
+// dispInjectDynamicFile applies dynamic-file art via the ported engine.
+func dispInjectDynamicFile(action, file, dynDir string) {
+	runInjectDynamic([]string{action, file, dynDir})
+}
+
+// ===== from reconcile.go =====
+
+// reconcile.go — faithful Go port of stacks_reconcile.py.
+// Container-state reconcile for `stacks ... repair`: for one compose file, bring
+// container state in line with what the compose DEFINES, healing half-up stacks:
+//   1. remove orphan hash-prefixed dup containers (<12hex>_<name>) for this stack
+//   2. start this stack's containers stuck in 'created'
+//   3. create defined-but-missing services one at a time (compose up --no-deps key)
+// Per-service so one failure never blocks the rest. Idempotent.
+
+var (
+	reSvcKey    = regexp.MustCompile(`^  ([A-Za-z0-9_.-]+):\s*$`)
+	reCName     = regexp.MustCompile(`^\s+container_name:\s*"?([A-Za-z0-9_.-]+)`)
+	reOrphanDup = regexp.MustCompile(`^[0-9a-f]{12}_(.+)$`)
+)
+
+// parseServices mirrors parse_services(): {container_name: service_key}.
+func parseServices(stackFile string) map[string]string {
+	defn := map[string]string{}
+	raw, err := os.ReadFile(stackFile)
+	if err != nil {
+		return defn
+	}
+	key := ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		if m := reSvcKey.FindStringSubmatch(line + "\n"); m != nil {
+			key = m[1]
+			continue
+		}
+		if cm := reCName.FindStringSubmatch(line); cm != nil && key != "" {
+			defn[cm[1]] = key
+		}
+	}
+	return defn
+}
+
+// reconcile mirrors reconcile(): heal one stack file; prints actions, returns summary.
+func reconcile(stackFile string) string {
+	if st, err := os.Stat(stackFile); err != nil || st.IsDir() {
+		return "reconcile: no such stack file"
+	}
+	defn := parseServices(stackFile)
+	if len(defn) == 0 {
+		return "reconcile: no services defined"
+	}
+	names := map[string]bool{}
+	for n := range defn {
+		names[n] = true
+	}
+	states := containerStateMap()
+	cwd := filepath.Dir(stackFile)
+	var actions []string
+
+	// 1. remove orphan hash-prefixed duplicates for this stack's services
+	for _, n := range keysOf(states) {
+		if m := reOrphanDup.FindStringSubmatch(n); m != nil && names[m[1]] {
+			if removeContainer(n, true, false) {
+				actions = append(actions, "removed orphan dup "+n)
+				delete(states, n)
+			}
+		}
+	}
+
+	// 2. start this stack's 'created' (never-started) containers
+	for cname := range names {
+		if states[cname] == "created" {
+			if startContainer(cname) {
+				actions = append(actions, "started "+cname)
+			} else {
+				actions = append(actions, "start-FAILED "+cname)
+			}
+		}
+	}
+
+	// 3. create defined-but-missing services, one at a time
+	for cname, key := range defn {
+		if _, ok := states[cname]; !ok {
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+			cmd := exec.CommandContext(ctx, "docker", "compose", "-f", stackFile,
+				"up", "-d", "--no-deps", key)
+			cmd.Dir = cwd
+			cmd.Env = dockerEnv()
+			var errb strings.Builder
+			cmd.Stderr = &errb
+			err := cmd.Run()
+			cancel()
+			if err == nil {
+				actions = append(actions, "created "+cname)
+			} else {
+				last := lastLine(strings.TrimSpace(errb.String()))
+				if len(last) > 70 {
+					last = last[:70]
+				}
+				actions = append(actions, "create-FAILED "+cname+": "+last)
+			}
+		}
+	}
+
+	for _, a := range actions {
+		fmt.Println("  " + a)
+	}
+	if len(actions) > 0 {
+		return "reconcile: " + strconv.Itoa(len(actions)) + " action(s)"
+	}
+	return "reconcile: already consistent"
+}
+
+// keysOf returns a snapshot of a map's keys (so we can delete while iterating).
+func keysOf(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// lastLine returns the final non-empty line of s (mirrors splitlines()[-1]).
+func lastLine(s string) string {
+	if s == "" {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	return lines[len(lines)-1]
+}
+
+// ===== from proxyscale.go =====
+
+// proxyscale.go — faithful Go port of stacks_proxy_file.py + stacks_scale_file.py.
+// Toggle a label across a compose file: proxy = traefik.enable=<val>;
+// scale = sablier.enable=<val> + sablier.group=<prefix>. Either one service
+// (container_name == svc) or "__all__" (every service, honoring a skip list).
+
+var (
+	reCnameWS = regexp.MustCompile(`\s+container_name:\s+(\S+)`)
+	reLabels  = regexp.MustCompile(`\s+labels:\s*$`)
+	rePrefix  = regexp.MustCompile(`([a-zA-Z]+)`)
+)
+
+// toggleSpec captures the differences between proxy and scale.
+type toggleSpec struct {
+	enableKey    string          // "traefik.enable" / "sablier.enable"
+	allInsert    func() []string // lines to insert in the __all__ path
+	singleInsert string          // string spliced after labels: in the single-svc path
+}
+
+// proxyFile mirrors stacks_proxy_file.py.
+func proxyFile(path, svc, val, skipArg string) {
+	applyToggle(path, svc, val, skipArg, toggleSpec{
+		enableKey:    "traefik.enable",
+		allInsert:    func() []string { return []string{`      - "traefik.enable=` + val + `"`} },
+		singleInsert: "\n      - \"traefik.enable=" + val + "\"",
+	})
+}
+
+// scaleFile mirrors stacks_scale_file.py.
+func scaleFile(path, svc, val, skipArg string) {
+	prefix := ""
+	if m := rePrefix.FindStringSubmatch(filepath.Base(path)); m != nil {
+		prefix = m[1]
+	}
+	applyToggle(path, svc, val, skipArg, toggleSpec{
+		enableKey: "sablier.enable",
+		allInsert: func() []string {
+			return []string{`      - "sablier.enable=` + val + `"`, `      - "sablier.group=` + prefix + `"`}
+		},
+		singleInsert: "\n      - \"sablier.enable=" + val + "\"\n      - \"sablier.group=" + prefix + "\"",
+	})
+}
+
+func applyToggle(path, svc, val, skipArg string, sp toggleSpec) {
+	var skip []string
+	if val == "true" {
+		skip = strings.Fields(skipArg)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	content := string(raw)
+	subRe := regexp.MustCompile(regexp.QuoteMeta(sp.enableKey) + `=(true|false)`)
+	repl := sp.enableKey + "=" + val
+
+	if svc == "__all__" {
+		lines := splitLines(content)
+		var result []string
+		skipCurrent, inLabels, hasX := false, false, false
+		labelInsertIdx := -1
+		for _, line := range lines {
+			if m := reCnameWS.FindStringSubmatch(line); m != nil {
+				if !skipCurrent && !hasX && labelInsertIdx != -1 {
+					result = insertAt(result, labelInsertIdx, sp.allInsert()...)
+				}
+				skipCurrent = inList(skip, m[1])
+				inLabels, hasX, labelInsertIdx = false, false, -1
+			}
+			if !skipCurrent {
+				switch {
+				case reLabels.MatchString(line):
+					inLabels, hasX = true, false
+				case inLabels && strings.HasPrefix(strings.TrimSpace(line), "- "):
+					if strings.Contains(line, sp.enableKey) {
+						hasX = true
+						line = subRe.ReplaceAllString(line, repl)
+					} else {
+						labelInsertIdx = len(result) + 1
+					}
+				case inLabels && strings.TrimSpace(line) != "" && !strings.HasPrefix(strings.TrimSpace(line), "-"):
+					if !hasX && labelInsertIdx != -1 {
+						result = insertAt(result, labelInsertIdx, sp.allInsert()...)
+						hasX = true
+					}
+					inLabels = false
+				}
+			}
+			result = append(result, line)
+		}
+		newContent := strings.Join(result, "\n")
+		if newContent != content {
+			os.WriteFile(path, []byte(newContent), 0644)
+		}
+		return
+	}
+
+	// single service
+	if inList(skip, svc) {
+		return
+	}
+	idx := strings.Index(content, "container_name: "+svc)
+	if idx < 0 {
+		return
+	}
+	end := len(content)
+	if rel := strings.Index(content[idx:], "\n  #"); rel >= 0 {
+		end = idx + rel
+	}
+	block := content[idx:end]
+	var newBlock string
+	if strings.Contains(block, sp.enableKey) {
+		newBlock = subRe.ReplaceAllString(block, repl)
+	} else if labelIdx := strings.Index(block, "labels:"); labelIdx >= 0 {
+		insertPos := len(block)
+		if rel := strings.Index(block[labelIdx+len("labels:"):], "\n"); rel >= 0 {
+			insertPos = labelIdx + len("labels:") + rel
+		}
+		newBlock = block[:insertPos] + sp.singleInsert + block[insertPos:]
+	} else {
+		newBlock = block
+	}
+	if newBlock != block {
+		os.WriteFile(path, []byte(content[:idx]+newBlock+content[end:]), 0644)
+	}
+}
+
+// splitLines mirrors Python str.splitlines() for \n (drops a single trailing empty).
+func splitLines(s string) []string {
+	if s == "" {
+		return []string{}
+	}
+	parts := strings.Split(s, "\n")
+	if len(parts) > 0 && parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
+	return parts
+}
+
+// insertAt mirrors list.insert for one-or-more items (clamps idx to bounds).
+func insertAt(s []string, idx int, items ...string) []string {
+	if idx > len(s) {
+		idx = len(s)
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	out := make([]string, 0, len(s)+len(items))
+	out = append(out, s[:idx]...)
+	out = append(out, items...)
+	out = append(out, s[idx:]...)
+	return out
+}
+
+func inList(l []string, v string) bool {
+	for _, x := range l {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// ===== from inject.go =====
+
+// inject.go — faithful Go port of stacks_inject.py.
+
+// injectArtKey holds one art section's content keyed by section name.
+type injectState struct {
+	art       map[string]string
+	stacksDir string
+	confPath  string
+	urlConf   string
+	mode      string
+}
+
+var injectReName = regexp.MustCompile(`^name:`)
+var injectReServices = regexp.MustCompile(`^services:`)
+var injectReXcaps = regexp.MustCompile(`^x-`)
+var injectReNetworks = regexp.MustCompile(`^networks:`)
+var injectReVolumes = regexp.MustCompile(`^volumes:`)
+var injectReDefaultDir = regexp.MustCompile(`(?m)^DEFAULT_STACKS_DIR=["'](.*)["']`)
+
+// cmdInject is the entry point: argv = [action, target, mode?]
+// action = "inject" or "strip"; target = "all"/"--all" or a file path/name;
+// mode = "art"/"urls"/"all" (default "all").
+func cmdInject(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: inject <inject|strip> <all|file> [art|urls|all]")
+		os.Exit(1)
+	}
+	action := args[0]
+	target := args[1]
+	mode := "all"
+	if len(args) > 2 {
+		mode = args[2]
+	}
+
+	st := &injectState{
+		art:       map[string]string{"header": "", "footer": "", "xcaps": "", "networks": "", "volumes": "", "services": ""},
+		stacksDir: stacksDir(),
+		confPath:  filepath.Join(configDir(), "art.conf"),
+		urlConf:   filepath.Join(configDir(), "stack_urls.conf"),
+		mode:      mode,
+	}
+
+	if data, err := os.ReadFile(st.confPath); err == nil {
+		confContent := string(data)
+		if m := injectReDefaultDir.FindStringSubmatch(confContent); m != nil {
+			st.stacksDir = m[1]
+		}
+
+		for _, pair := range [][2]string{
+			{"_ba_header", "header"},
+			{"_ba_footer", "footer"},
+			{"_ba_xcaps", "xcaps"},
+			{"_ba_networks", "networks"},
+			{"_ba_volumes", "volumes"},
+			{"_ba_services", "services"},
+		} {
+			key := pair[1]
+			startMarker := "##BELLZART_START_" + strings.ToUpper(key)
+			endMarker := "##BELLZART_END_" + strings.ToUpper(key)
+			if strings.Contains(confContent, startMarker) && strings.Contains(confContent, endMarker) {
+				afterStart := strings.SplitN(confContent, startMarker, 2)[1]
+				body := strings.SplitN(afterStart, endMarker, 2)[0]
+				st.art[key] = strings.Trim(body, "\n")
+			}
+		}
+	}
+
+	// Resolve target file list.
+	var files []string
+	if target == "--all" || target == "all" {
+		if entries, err := os.ReadDir(st.stacksDir); err == nil {
+			for _, e := range entries {
+				name := e.Name()
+				if strings.HasSuffix(name, ".yml") || strings.HasSuffix(name, ".yaml") {
+					files = append(files, filepath.Join(st.stacksDir, name))
+				}
+			}
+		}
+	} else if filepath.IsAbs(target) && injectIsFile(target) {
+		files = []string{target}
+	} else if injectIsFile(filepath.Join(st.stacksDir, target)) {
+		files = []string{filepath.Join(st.stacksDir, target)}
+	} else if injectIsFile(filepath.Join(st.stacksDir, target+".yml")) {
+		files = []string{filepath.Join(st.stacksDir, target+".yml")}
+	}
+
+	for _, f := range files {
+		if action == "strip" {
+			st.stripFile(f)
+		} else {
+			st.injectFile(f)
+		}
+	}
+}
+
+func injectIsFile(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+// getCustomStackDirectory faithfully ports get_custom_stack_directory.
+func (s *injectState) getCustomStackDirectory(filePath string) string {
+	if !injectFileExists(s.urlConf) {
+		return ""
+	}
+	base := filepath.Base(filePath)
+	stackName := strings.TrimSuffix(base, filepath.Ext(base))
+
+	data, err := os.ReadFile(s.urlConf)
+	if err != nil {
+		return ""
+	}
+	// Mirror Python str.splitlines(): split on line boundaries, drop the
+	// separators, and produce no trailing empty element. This also strips
+	// any '\r' from CRLF endings (Python splitlines does), so lines kept
+	// in dir_lines match what Python would append.
+	lines := injectSplitLines(string(data))
+
+	targetSection := "[" + stackName + "]"
+	inSection := false
+	var dirLines []string
+
+	for _, line := range lines {
+		sLine := strings.TrimSpace(line)
+		if strings.HasPrefix(sLine, "[") && strings.HasSuffix(sLine, "]") {
+			if sLine == targetSection {
+				inSection = true
+				continue
+			} else if inSection {
+				break
+			} else {
+				inSection = false
+				continue
+			}
+		}
+		if inSection {
+			dirLines = append(dirLines, line)
+		}
+	}
+
+	if len(dirLines) > 0 {
+		return strings.Trim(strings.Join(dirLines, "\n"), "\n")
+	}
+	return ""
+}
+
+// stripFile faithfully ports strip_file.
+func (s *injectState) stripFile(path string) {
+	if !injectFileExists(path) {
+		return
+	}
+	lines := injectReadLines(path)
+	var out []string
+	skip := false
+	for _, l := range lines {
+		if strings.Contains(l, "##BELLZART_START") {
+			skip = true
+			continue
+		}
+		if strings.Contains(l, "##BELLZART_END") {
+			skip = false
+			continue
+		}
+		if !skip {
+			out = append(out, l)
+		}
+	}
+	// Also remove large comment blocks (art/URLs = 3+ consecutive # lines)
+	var cleaned []string
+	i := 0
+	for i < len(out) {
+		if strings.HasPrefix(strings.TrimSpace(out[i]), "#") {
+			var block []string
+			for i < len(out) && strings.HasPrefix(strings.TrimSpace(out[i]), "#") {
+				block = append(block, out[i])
+				i++
+			}
+			if len(block) < 3 {
+				cleaned = append(cleaned, block...)
+			}
+		} else {
+			cleaned = append(cleaned, out[i])
+			i++
+		}
+	}
+	injectWriteLines(path, cleaned)
+}
+
+// injectFile faithfully ports inject_file.
+func (s *injectState) injectFile(path string) {
+	if !injectFileExists(path) {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	content := string(data)
+	if !strings.Contains(content, "services:") && !strings.Contains(content, "networks:") {
+		return
+	}
+	s.stripFile(path)
+	customDirectory := s.getCustomStackDirectory(path)
+	lines := injectReadLines(path)
+	var out []string
+	did := map[string]bool{"header": false, "footer": false, "xcaps": false, "networks": false, "volumes": false, "services": false}
+
+	for _, line := range lines {
+		ss := strings.TrimRight(line, " \t\r\n")
+		if !did["header"] && injectReName.MatchString(ss) {
+			out = append(out, line)
+			if s.art["header"] != "" {
+				out = append(out, s.art["header"]+"\n")
+			}
+			if customDirectory != "" && (s.mode == "all" || s.mode == "urls") {
+				out = append(out, "\n"+customDirectory+"\n")
+			}
+			did["header"] = true
+			continue
+		}
+		if !did["header"] && injectReServices.MatchString(ss) {
+			if s.art["header"] != "" {
+				out = append(out, s.art["header"]+"\n")
+			}
+			if customDirectory != "" && (s.mode == "all" || s.mode == "urls") {
+				out = append(out, "\n"+customDirectory+"\n")
+			}
+			did["header"] = true
+		}
+		if !did["xcaps"] && injectReXcaps.MatchString(ss) {
+			if s.art["xcaps"] != "" {
+				out = append(out, s.art["xcaps"]+"\n")
+			}
+			did["xcaps"] = true
+		}
+		if !did["networks"] && injectReNetworks.MatchString(ss) {
+			if s.art["networks"] != "" {
+				out = append(out, s.art["networks"]+"\n")
+			}
+			did["networks"] = true
+		}
+		if !did["volumes"] && injectReVolumes.MatchString(ss) {
+			if s.art["volumes"] != "" {
+				out = append(out, s.art["volumes"]+"\n")
+			}
+			did["volumes"] = true
+		}
+		if !did["services"] && injectReServices.MatchString(ss) {
+			if s.art["services"] != "" {
+				out = append(out, s.art["services"]+"\n")
+			}
+			did["services"] = true
+		}
+		out = append(out, line)
+	}
+	if s.art["footer"] != "" {
+		out = append(out, s.art["footer"]+"\n")
+	}
+	injectWriteLines(path, out)
+}
+
+// injectFileExists mirrors os.path.exists for a file path.
+func injectFileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// injectReadLines reads a file as Python readlines() would: each element keeps
+// its trailing newline; the final line keeps no newline if the file lacks one.
+func injectReadLines(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	s := string(data)
+	var lines []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			lines = append(lines, s[start:i+1])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
+
+// injectSplitLines mirrors Python str.splitlines(): it splits on \n, \r and
+// \r\n boundaries, removes the separators, and yields no trailing empty
+// element for a final boundary. An empty input yields no lines.
+func injectSplitLines(s string) []string {
+	var lines []string
+	start := 0
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == '\n' {
+			lines = append(lines, s[start:i])
+			i++
+			start = i
+		} else if c == '\r' {
+			lines = append(lines, s[start:i])
+			i++
+			if i < len(s) && s[i] == '\n' {
+				i++
+			}
+			start = i
+		} else {
+			i++
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
+
+// injectWriteLines mirrors writelines(): concatenate elements verbatim.
+func injectWriteLines(path string, lines []string) {
+	var b strings.Builder
+	for _, l := range lines {
+		b.WriteString(l)
+	}
+	_ = os.WriteFile(path, []byte(b.String()), 0644)
 }
