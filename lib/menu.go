@@ -902,8 +902,8 @@ var tuiContainerActions = []tuiAction{
 	{"⚡  Repair (FORCE)", "repair_force"},
 	{"⚡  Fix + Repair + Recreate + Up (FORCE)", "full_repair_force"},
 	{"⚡  Repair + Fix + Recreate + Up (FORCE)", "deep_repair_force"},
-	{"↑  Scale ON", "scale_on"},
-	{"↓  Scale OFF", "scale_off"},
+	// (old Sablier "Scale ON/OFF" removed — wake-on-visit is now the ⚡ Zero Scale
+	// popup, inserted above, which toggles per-container with no compose edits)
 	{"↑  Proxy ON", "proxy_on"},
 	{"↓  Proxy OFF", "proxy_off"},
 	{"🔍  Inspect", "inspect"},
