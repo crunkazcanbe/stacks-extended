@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -404,6 +405,31 @@ func imageInspect(img string) map[string]interface{} {
 		return empty
 	}
 	return m
+}
+
+// imageExistsLocal reports whether an image ref is already present locally.
+func imageExistsLocal(img string) bool {
+	return len(imageInspect(img)) > 0
+}
+
+// apiPullImage pulls an image the way it should be done — via the Docker Engine
+// API (ImagePull), draining the progress stream to completion. Falls back to the
+// docker CLI when the API client isn't available. Returns nil on success.
+func apiPullImage(img string) error {
+	if apiMode() {
+		ctx, cancel := context.WithTimeout(dockerCtx, 30*time.Minute)
+		defer cancel()
+		rc, err := dockerClient().ImagePull(ctx, img, image.PullOptions{})
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+		_, err = io.Copy(io.Discard, rc) // block until the pull finishes
+		return err
+	}
+	cmd := exec.Command("docker", "pull", img)
+	cmd.Env = dockerEnv()
+	return cmd.Run()
 }
 
 // dockerVolumes mirrors volumes(): all volumes (API).
@@ -1300,6 +1326,7 @@ var scalarMap = map[string]string{
 	"watch_site_timeout":  "WATCH_SITE_TIMEOUT",  // seconds to wait for a site to answer
 	"heal_grace":          "HEAL_GRACE",          // seconds to leave a stack alone after a heal (anti-loop grace)
 	"boot_verify_sites":   "BOOT_VERIFY_SITES",   // at boot, after bring-up, verify sites + heal the broken ones
+	"watch_pull_missing":  "WATCH_PULL_MISSING",  // watchdog auto-pulls any missing images (background, one at a time)
 	// ── auto-discovery (no reliance on STACKS_DIR) ────────────────────────────
 	"auto_detect_containers": "AUTO_DETECT_CONTAINERS", // show ALL running containers (Docker API), on by default
 	"auto_detect_stacks":     "AUTO_DETECT_STACKS",     // auto-find compose stacks (Docker API labels)
@@ -1397,9 +1424,29 @@ func fromConf() map[string]string {
 			continue
 		}
 		k, val, _ := strings.Cut(line, "=")
-		cfg[strings.TrimSpace(k)] = strings.TrimSpace(val)
+		cfg[strings.TrimSpace(k)] = stripInlineComment(strings.TrimSpace(val))
 	}
 	return cfg
+}
+
+// stripInlineComment removes a trailing " # comment" from an UNQUOTED conf value
+// (a value containing whitespace before the #). Quoted values are returned as-is
+// (minus the surrounding quotes) so a literal # inside them is preserved. This
+// makes KEY=1   # note parse to "1", not "1   # note".
+func stripInlineComment(v string) string {
+	if v == "" {
+		return v
+	}
+	if (strings.HasPrefix(v, `"`) && strings.HasSuffix(v, `"`)) ||
+		(strings.HasPrefix(v, "'") && strings.HasSuffix(v, "'")) {
+		return v[1 : len(v)-1]
+	}
+	if i := strings.Index(v, " #"); i >= 0 {
+		v = strings.TrimSpace(v[:i])
+	} else if i := strings.Index(v, "\t#"); i >= 0 {
+		v = strings.TrimSpace(v[:i])
+	}
+	return v
 }
 
 // configLoad mirrors load(): internal-key config from stacks.yaml (fallback conf).

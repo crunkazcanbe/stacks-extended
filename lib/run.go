@@ -86,8 +86,9 @@ func Run() {
 		cmdZeroScale(rest) // zeroscale.go — wake-on-visit engine (Sablier replacement)
 	case "park":
 		cmdPark(rest) // zeroscale.go — sleep all but never_sleep (replaces old stacks-park)
-	case "argus", "edge", "sentinel":
-		cmdArgus(rest) // argus.go — VPS edge-watchdog: probe public sites + repair the edge
+	case "edge", "argus", "sentinel":
+		cmdEdge(rest) // edge.go — VPS edge watchdog: probe public sites + repair the edge
+			//          ("argus" kept as a legacy alias)
 	case "down":
 		dispDown(dispParse(cmd, rest))
 	case "start", "stop", "restart":

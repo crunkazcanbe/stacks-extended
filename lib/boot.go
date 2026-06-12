@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -341,6 +342,92 @@ func bootDownloadMissing(bootList []string) {
 	}
 }
 
+// ── auto-pull missing images (watchdog) ─────────────────────────────────────
+
+// bootImageRe matches `image: repo:tag` lines in a compose file.
+var bootImageRe = regexp.MustCompile(`(?m)^[\t ]*image:[\t ]*["']?([^"'#\s]+)`)
+
+// stackImageRefs returns the deduped image references a stack declares, read
+// from its compose file (universal: works wherever the file lives).
+func stackImageRefs(stack string) []string {
+	f := stackFileFor(stack)
+	if f == "" {
+		return nil
+	}
+	data, err := os.ReadFile(f)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var imgs []string
+	for _, m := range bootImageRe.FindAllStringSubmatch(string(data), -1) {
+		img := strings.TrimSpace(m[1])
+		if img == "" || strings.Contains(img, "${") || seen[img] { // skip unresolved ${VARS}
+			continue
+		}
+		seen[img] = true
+		imgs = append(imgs, img)
+	}
+	return imgs
+}
+
+// pullGuard ensures only ONE background pull sweep runs at a time, so a slow
+// pull never overlaps itself across watchdog ticks.
+var pullGuard sync.Mutex
+var pullRunning bool
+
+// maybePullMissing — when WATCH_PULL_MISSING is on, scan the watched stacks for
+// any declared image that isn't present locally and pull them in the background,
+// ONE AT A TIME (gentle), via the Docker API. Non-blocking: the watchdog keeps
+// checking/healing sites while images download. A new sweep won't start while a
+// previous one is still pulling.
+func maybePullMissing(stacks []string, cfg map[string]string) {
+	if !cfgBoolKey(cfg, "WATCH_PULL_MISSING", false) {
+		return
+	}
+	pullGuard.Lock()
+	if pullRunning {
+		pullGuard.Unlock()
+		return
+	}
+	// collect what's missing (cheap: local inspects) before committing to a run
+	seen := map[string]bool{}
+	var missing []string
+	for _, s := range stacks {
+		for _, img := range stackImageRefs(s) {
+			if seen[img] {
+				continue
+			}
+			seen[img] = true
+			if !imageExistsLocal(img) {
+				missing = append(missing, img)
+			}
+		}
+	}
+	if len(missing) == 0 {
+		pullGuard.Unlock()
+		return
+	}
+	pullRunning = true
+	pullGuard.Unlock()
+
+	go func() {
+		defer func() { pullGuard.Lock(); pullRunning = false; pullGuard.Unlock() }()
+		fmt.Printf("\x1b[36m⤓ watchdog: %d image(s) missing — pulling one at a time…\x1b[0m\n", len(missing))
+		for _, img := range missing {
+			if imageExistsLocal(img) { // may have arrived via another path
+				continue
+			}
+			fmt.Printf("\x1b[36m  ⤓ pulling %s\x1b[0m\n", img)
+			if err := apiPullImage(img); err != nil {
+				fmt.Printf("\x1b[33m  ⚠ pull failed for %s: %v\x1b[0m\n", img, err)
+			} else {
+				fmt.Printf("\x1b[32m  ✔ pulled %s\x1b[0m\n", img)
+			}
+		}
+	}()
+}
+
 // ── watchdog ────────────────────────────────────────────────────────────────
 
 // extractHosts pulls every Host(`…`) hostname out of a blob of Traefik rule text.
@@ -459,6 +546,9 @@ func cmdWatch(args []string) {
 		cfg := configLoad()
 		checkSites := cfgBoolKey(cfg, "WATCH_SITES", false)
 		grace := time.Duration(cfgInt(cfg, "HEAL_GRACE", 120)) * time.Second
+		// Auto-pull any missing images for the watched stacks, in the background,
+		// one at a time (WATCH_PULL_MISSING). Non-blocking — healing continues.
+		maybePullMissing(bc.watchStacks, cfg)
 		var down []string
 		for _, s := range bc.watchStacks {
 			if t, ok := lastHeal[s]; ok && time.Since(t) < grace {
