@@ -1285,6 +1285,10 @@ var scalarMap = map[string]string{
 	"watch_strategy": "WATCH_STRATEGY", // what to do to a down service: up | repair | recreate | fix
 	"watch_escalate": "WATCH_ESCALATE", // climb the escalation chain if it stays unhealthy
 	"watch_force":    "WATCH_FORCE",    // always apply the chain vs only-if-needed
+	// watchdog: verify the SITE actually serves (not just that the container runs)
+	"watch_sites":         "WATCH_SITES",         // HTTP-check each watched stack's site(s) and heal if broken
+	"watch_site_ok_codes": "WATCH_SITE_OK_CODES", // HTTP codes that count as "site working" (comma list)
+	"watch_site_timeout":  "WATCH_SITE_TIMEOUT",  // seconds to wait for a site to answer
 	// ── auto-discovery (no reliance on STACKS_DIR) ────────────────────────────
 	"auto_detect_containers": "AUTO_DETECT_CONTAINERS", // show ALL running containers (Docker API), on by default
 	"auto_detect_stacks":     "AUTO_DETECT_STACKS",     // auto-find compose stacks (Docker API labels)

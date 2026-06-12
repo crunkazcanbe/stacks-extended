@@ -315,6 +315,94 @@ func bootDownloadMissing(bootList []string) {
 
 // ── watchdog ────────────────────────────────────────────────────────────────
 
+// extractHosts pulls every Host(`…`) hostname out of a blob of Traefik rule text.
+func extractHosts(s string) []string {
+	seen := map[string]bool{}
+	var hosts []string
+	for {
+		i := strings.Index(s, "Host(`")
+		if i < 0 {
+			break
+		}
+		s = s[i+6:]
+		j := strings.IndexByte(s, '`')
+		if j < 0 {
+			break
+		}
+		if h := s[:j]; !seen[h] && strings.Contains(h, ".") {
+			seen[h] = true
+			hosts = append(hosts, h)
+		}
+	}
+	return hosts
+}
+
+// stackHosts finds the public hostnames a stack serves — UNIVERSAL: it reads the
+// Traefik router rules from the stack's container LABELS via the Docker API (the
+// standard label-provider way that works on ANY Docker+Traefik host), and only
+// falls back to a Traefik file-provider dynamics file (DYNAMICS_DIR/<stack>.yml)
+// when there are no labels (file-provider setups like Bellz's).
+func stackHosts(stack string, cfg map[string]string) []string {
+	// 1) Docker labels on the stack's containers (universal)
+	out, _ := exec.Command("docker", "ps", "--filter",
+		"label=com.docker.compose.project="+stack, "--format", "{{.Names}}").Output()
+	seen := map[string]bool{}
+	var hosts []string
+	for _, name := range strings.Fields(string(out)) {
+		lbl, _ := exec.Command("docker", "inspect", "-f",
+			"{{range .Config.Labels}}{{println .}}{{end}}", name).Output()
+		for _, h := range extractHosts(string(lbl)) {
+			if !seen[h] {
+				seen[h] = true
+				hosts = append(hosts, h)
+			}
+		}
+	}
+	if len(hosts) > 0 {
+		return hosts
+	}
+	// 2) fallback: a Traefik file-provider dynamics file for this stack
+	dir := cfg["DYNAMICS_DIR"]
+	if dir == "" {
+		dir = filepath.Join(stacksDir(), "..", "Configs", "Dynamics")
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, stack+".yml")); err == nil {
+		return extractHosts(string(data))
+	}
+	return nil
+}
+
+// siteOK does an HTTP check of a public site (following redirects) and returns
+// whether the FINAL status is in the acceptable set. Following redirects is key:
+// a working auth gate ends at a 200 login page, but a BROKEN gate ends at a 404 —
+// exactly the Vaultwarden case (302→404).
+func siteOK(host string, cfg map[string]string) bool {
+	ok := cfg["WATCH_SITE_OK_CODES"]
+	if ok == "" {
+		ok = "200,204,301,302,307,308,401,403,405"
+	}
+	to := cfg["WATCH_SITE_TIMEOUT"]
+	if to == "" {
+		to = "12"
+	}
+	out, _ := exec.Command("curl", "-skL", "-m", to, "-o", "/dev/null",
+		"-w", "%{http_code}", "https://"+host+"/").Output()
+	code := strings.TrimSpace(string(out))
+	if code == "" || code == "000" {
+		return false // timeout / connection failure
+	}
+	return strings.Contains(","+ok+",", ","+code+",")
+}
+
+// stackSiteOK checks ONE representative host of the stack (the primary site).
+func stackSiteOK(stack string, cfg map[string]string) bool {
+	hosts := stackHosts(stack, cfg)
+	if len(hosts) == 0 {
+		return true // no public site → nothing to check, don't flag it
+	}
+	return siteOK(hosts[0], cfg)
+}
+
 func cmdWatch(args []string) {
 	once := false
 	for _, a := range args {
@@ -332,9 +420,18 @@ func cmdWatch(args []string) {
 	for {
 		// reload config each sweep so Settings-tab edits take effect live
 		bc = loadBootConfig()
+		cfg := configLoad()
+		checkSites := cfgBoolKey(cfg, "WATCH_SITES", false)
 		var down []string
 		for _, s := range bc.watchStacks {
 			if !stackHealthy(s) {
+				down = append(down, s)
+				continue
+			}
+			// container is up but is the SITE actually serving? (catches 502/404
+			// where the app/route is broken even though docker says "running")
+			if checkSites && !stackSiteOK(s, cfg) {
+				fmt.Printf("\x1b[31m✘ %s: containers up but site not serving — healing\x1b[0m\n", s)
 				down = append(down, s)
 			}
 		}
