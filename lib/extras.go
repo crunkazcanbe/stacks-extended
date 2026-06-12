@@ -616,7 +616,7 @@ func cmdReclaim(args []string) {
 // ends with a newline (before the closing triple-quote); reproduce both so the
 // output of `print(__doc__)` matches byte-for-byte.
 const reclaimDoc = `
-stacks_reclaim.py — reclaim disk by removing UNUSED tagged images, by size.
+stacks reclaim — reclaim disk by removing UNUSED tagged images, by size.
 
 Lists every local image largest-first, classifies each as:
   • in-use     — a container (running OR stopped) is built on it, OR it is
@@ -631,9 +631,9 @@ Removal uses ` + "`docker rmi`" + ` WITHOUT --force, so an image still wired to 
 container can never be pulled out from under it — Docker refuses and we skip it.
 
 CLI:
-    stacks_reclaim.py report  [--json] [--all] [--min-size MB]
-    stacks_reclaim.py clean   [--auto] [--dangling] [--dry-run] [--min-size MB]
-                              [--force]            # allow rmi --force (untag only)
+    stacks reclaim report  [--json] [--all] [--min-size MB]
+    stacks reclaim clean   [--auto] [--dangling] [--dry-run] [--min-size MB]
+                           [--force]            # allow rmi --force (untag only)
 `
 
 // ===== from updates.go =====
@@ -1746,19 +1746,19 @@ func (m selfupdateOrderedMap) MarshalJSON() ([]byte, error) {
 // ── doc string (printed for no-args / unknown subcommands) ────────────────────
 
 const imageHistoryDoc = `
-stacks_image_history.py — per-image version history + rollback.
+stacks images — per-image version history + rollback.
 
 Keeps a SQLite history of every distinct image digest we've seen for each
 ` + "`repo:tag`" + ` referenced by the stacks, so you can roll a container back to an
-older version. Config:
-    IMAGE_HISTORY_ENABLED = 1     # record snapshots
-    IMAGE_HISTORY_KEEP    = 10    # versions kept per image (oldest pruned)
+older version. Config (stacks.conf):
+    IMAGE_HISTORY_ENABLED=1     # record snapshots
+    IMAGE_HISTORY_KEEP=10       # versions kept per image (oldest pruned)
 
 CLI:
-    stacks_image_history.py snapshot          # record current digest of every image
-    stacks_image_history.py list <image>      # show recorded versions, newest first
-    stacks_image_history.py rollback <image> <digest>   # pin+retag+(caller recreates)
-    stacks_image_history.py prune             # enforce keep-count on all images
+    stacks images snapshot               # record current digest of every image
+    stacks images list <image>           # show recorded versions, newest first
+    stacks images rollback <image> <digest>   # pin+retag+(caller recreates)
+    stacks images prune                  # enforce keep-count on all images
 `
 
 // imageHistoryDBPath mirrors DB_PATH: configDir()/image_history.db.

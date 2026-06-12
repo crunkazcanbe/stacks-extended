@@ -228,6 +228,13 @@ func cmdLs(args []string) {
 	dir := stacksDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("📦 no stacks directory yet (%s)\n", dir)
+			fmt.Println("   nothing to list here. Set STACKS_DIR (or stacks_dir in stacks.conf)")
+			fmt.Println("   to point at your compose files — Docker commands (status/ls/inspect)")
+			fmt.Println("   work fine without it.")
+			return
+		}
 		fmt.Println("cannot read", dir, ":", err)
 		return
 	}
