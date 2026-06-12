@@ -84,6 +84,8 @@ func Run() {
 		cmdBoot([]string{"install"}) // boot.go — install Docker (if missing) + boot/watchdog services
 	case "zeroscale", "zs", "wake":
 		cmdZeroScale(rest) // zeroscale.go — wake-on-visit engine (Sablier replacement)
+	case "park":
+		cmdPark(rest) // zeroscale.go — sleep all but never_sleep (replaces old stacks-park)
 	case "down":
 		dispDown(dispParse(cmd, rest))
 	case "start", "stop", "restart":

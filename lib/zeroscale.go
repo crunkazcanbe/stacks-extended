@@ -123,6 +123,42 @@ func isTraefikHelper(name string) bool {
 	return false
 }
 
+// cmdPark stops every running container NOT in the never_sleep list — i.e. only
+// your always-on infra stays up, everything else sleeps (and wakes on demand via
+// Zero Scale). Replaces the old python-dependent /usr/local/bin/stacks-park.
+// Dry-run by default; pass --apply (or "apply") to actually stop them.
+func cmdPark(args []string) {
+	apply := false
+	for _, a := range args {
+		if a == "--apply" || a == "apply" {
+			apply = true
+		}
+	}
+	cfg := configLoad()
+	ns := map[string]bool{}
+	for _, n := range strings.Fields(cfg["NEVER_SLEEP"]) {
+		ns[n] = true
+	}
+	out, _ := exec.Command("docker", "ps", "--format", "{{.Names}}").Output()
+	var park []string
+	for _, name := range strings.Fields(string(out)) {
+		if !ns[name] {
+			park = append(park, name)
+		}
+	}
+	fmt.Printf("\x1b[1;36mPark\x1b[0m  keep %d never-sleep up, sleep %d others\n", len(ns), len(park))
+	if !apply {
+		fmt.Println("  (dry-run — would stop:", strings.Join(park, " "), ")")
+		fmt.Println("  run 'stacks park --apply' to actually park them")
+		return
+	}
+	for _, name := range park {
+		fmt.Println("  💤", name)
+		_ = exec.Command("docker", "stop", name).Run()
+	}
+	fmt.Printf("\x1b[1;32m✔ parked %d\x1b[0m\n", len(park))
+}
+
 // ── dispatch ──────────────────────────────────────────────────────────────────
 
 func cmdZeroScale(args []string) {
