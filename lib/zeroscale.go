@@ -929,27 +929,36 @@ func loadingScreenHTML(screen, display, siteKey, host string) string {
 			return html
 		}
 	}
-	// Built-in DEFAULT screen — self-contained, ships with the program, used for
-	// everyone when no custom theme file is applied. Shows the whole group as a
-	// live checklist (each container flips to ✓ as it comes up), an animated bar,
-	// and the live Docker logs. Uses only the engine's own endpoints.
-	accent := "#7c9cff"
-	switch screen {
-	case "minecraft":
-		accent = "#5fb83c"
-	case "terminal":
-		accent = "#3ad14b"
-	case "synthwave":
-		accent = "#ff4dd2"
+	// Built-in themes — self-contained, ship WITH the program (no external files).
+	// A few professional options people can choose from (set per-site or via
+	// ZERO_SCALE_DEFAULT_SCREEN). Same structure (animated bar + live container
+	// checklist + color-coded logs); only the look changes.
+	type zsTheme struct{ bg, accent, fg, font string }
+	themes := map[string]zsTheme{
+		// modern, the professional default — soft aurora glow, clean
+		"aurora": {"radial-gradient(1200px 600px at 50% -10%,#1b2030,#0c0e16)", "#7c9cff", "#e7ebf5", "ui-monospace,'JetBrains Mono',Menlo,monospace"},
+		// minimal corporate — flat slate, sans-serif, teal-green accent (the "basic" one)
+		"slate": {"#0e1117", "#3ddc97", "#e6e9ef", "-apple-system,'Segoe UI',Roboto,system-ui,sans-serif"},
+		// clean terminal — black, green mono
+		"terminal": {"#050805", "#37d44a", "#bff0bf", "ui-monospace,Menlo,monospace"},
+		// deep midnight — navy with a violet accent
+		"midnight": {"linear-gradient(160deg,#0a0a1a,#15153a)", "#b08cff", "#e9e6ff", "ui-monospace,'JetBrains Mono',monospace"},
+		// built-in dirt fallback if no minecraft.html file
+		"minecraft": {"#2a1a0e", "#5fb83c", "#ece0cf", "ui-monospace,monospace"},
 	}
+	th, ok := themes[screen]
+	if !ok {
+		th = themes["aurora"]
+	}
+	accent := th.accent
 	return fmt.Sprintf(`<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Waking %[1]s…</title>
 <style>
  :root{--a:%[3]s}
  *{box-sizing:border-box}
- html,body{height:100%%;margin:0;background:radial-gradient(1200px 600px at 50%% -10%%,#1b2030,#0c0e16);
-   color:#e7ebf5;font-family:ui-monospace,'JetBrains Mono',Menlo,monospace}
+ html,body{height:100%%;margin:0;background:%[4]s;
+   color:%[5]s;font-family:%[6]s}
  .wrap{min-height:100%%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:24px}
  h1{font-size:1.9rem;margin:0;font-weight:700}
  h1 .a{color:var(--a)}
@@ -1000,5 +1009,5 @@ func loadingScreenHTML(screen, display, siteKey, host string) string {
    setTimeout(poll,2000);
  }
  group();setInterval(group,2000);setTimeout(poll,2500);
-</script></body></html>`, display, siteKey, accent)
+</script></body></html>`, display, siteKey, accent, th.bg, th.fg, th.font)
 }

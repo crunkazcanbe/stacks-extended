@@ -2219,7 +2219,7 @@ func contains(items []string, v string) bool {
 // config the engine watches: <configDir>/zeroscale.yaml.
 
 // the editable loading screens shipped with the engine
-var zsScreens = []string{"minecraft", "terminal", "ghost", "synthwave", "pride"}
+var zsScreens = []string{"aurora", "slate", "terminal", "midnight", "minecraft", "ghost", "synthwave", "pride"}
 
 type zsSite struct {
 	Host        []string `yaml:"host,omitempty"`
@@ -2278,7 +2278,7 @@ func loadZSConfig() *zsConfig {
 		c.PollSeconds = cfgInt(cfg, "ZERO_SCALE_POLL", 20)
 	}
 	if c.DefaultScreen == "" {
-		c.DefaultScreen = cfgStrKey(cfg, "ZERO_SCALE_DEFAULT_SCREEN", "minecraft")
+		c.DefaultScreen = cfgStrKey(cfg, "ZERO_SCALE_DEFAULT_SCREEN", "aurora")
 	}
 	if c.TraefikMetrics == "" {
 		c.TraefikMetrics = cfgStrKey(cfg, "ZERO_SCALE_METRICS", "")
