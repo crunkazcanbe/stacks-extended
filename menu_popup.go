@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/mattn/go-runewidth"
 )
 
 type tuiPopupKind int
@@ -53,37 +55,62 @@ type tuiPopup struct {
 // ── Rendering ────────────────────────────────────────────────────────────────
 
 func (p *tuiPopup) render(width int) string {
-	w := width - 4
+	// Size the box to the CONTENT (longest line) so it's a snug little popup
+	// floating over the screen, not a near-fullscreen panel. All widths are
+	// VISIBLE columns (emoji/wide-char aware) so the right border lines up.
+	need := vw(" " + p.title + " ") // title needs w-2 ≥ this
+	bump := func(textCols int) {    // a body line needs w-4 ≥ textCols
+		if textCols+4 > need {
+			need = textCols + 4
+		}
+		if textCols+2 > need {
+			need = textCols + 2
+		}
+	}
+	for _, a := range p.actions {
+		bump(vw("  " + a.Label))
+	}
+	for _, l := range p.lines {
+		bump(vw(l))
+	}
+	if p.kind == tuiPopupInput {
+		bump(vw(p.prompt))
+		bump(vw("> " + p.buf + "_"))
+		bump(vw("ENTER = save   ESC = cancel"))
+	}
+	bump(vw("↑↓ scroll  (000/000)  any key / ESC close"))
+	w := need + 2
+	if w < 28 {
+		w = 28
+	}
+	maxW := width - 4
+	if maxW > 66 { // keep popups compact even on wide screens
+		maxW = 66
+	}
+	if w > maxW {
+		w = maxW
+	}
 	if w < 20 {
 		w = 20
 	}
-	if w > 90 {
-		w = 90
-	}
 	var b strings.Builder
-	top := "╔" + strings.Repeat("═", w-2) + "╗"
 	bot := "╚" + strings.Repeat("═", w-2) + "╝"
-	title := " " + p.title + " "
-	if len(title) > w-2 {
-		title = title[:w-2]
+	title := vtrunc(" "+p.title+" ", w-2)
+	tw := vw(title)
+	tl := (w - 2 - tw) / 2
+	if tl < 0 {
+		tl = 0
 	}
-	// title centered on the top border
-	tl := (w - len(title)) / 2
-	if tl < 1 {
-		tl = 1
-	}
-	topLine := "╔" + strings.Repeat("═", tl-1) + title + strings.Repeat("═", w-tl-len(title)-1) + "╗"
+	tr := w - 2 - tw - tl
+	topLine := "╔" + strings.Repeat("═", tl) + title + strings.Repeat("═", tr) + "╗"
 	b.WriteString(tuiPopupBorder.Render(topLine))
 	b.WriteString("\n")
-	_ = top
 
 	body := func(s string) {
-		if len(s) > w-4 {
-			s = s[:w-4]
-		}
+		s = vtrunc(s, w-4)
 		b.WriteString(tuiPopupBorder.Render("║"))
 		b.WriteString(" " + s)
-		pad := w - 4 - len(s)
+		pad := w - 4 - vw(s)
 		if pad > 0 {
 			b.WriteString(strings.Repeat(" ", pad))
 		}
@@ -100,10 +127,7 @@ func (p *tuiPopup) render(width int) string {
 			end = len(p.actions)
 		}
 		for i := p.scroll; i < end; i++ {
-			label := p.actions[i].Label
-			if len(label) > w-6 {
-				label = label[:w-6]
-			}
+			label := vtrunc(p.actions[i].Label, w-6)
 			if i == p.sel {
 				b.WriteString(tuiPopupBorder.Render("║"))
 				b.WriteString(" " + tuiPopupSel.Render(padRight("  "+label, w-4)) + " ")
@@ -162,11 +186,67 @@ func (p *tuiPopup) render(width int) string {
 	return b.String()
 }
 
+// padRight pads (or truncates) s to n VISIBLE columns — emoji/wide-char aware,
+// so highlighted rows have the same width as the box and borders line up.
 func padRight(s string, n int) string {
-	if len(s) >= n {
-		return s[:n]
+	w := vw(s)
+	if w >= n {
+		return vtrunc(s, n)
 	}
-	return s + strings.Repeat(" ", n-len(s))
+	return s + strings.Repeat(" ", n-w)
+}
+
+// vw is the visible (display) column width of s — counts emoji + CJK as 2.
+func vw(s string) int { return runewidth.StringWidth(s) }
+
+// vtrunc truncates s to at most n visible columns (no tail).
+func vtrunc(s string, n int) string {
+	if n < 0 {
+		n = 0
+	}
+	if vw(s) <= n {
+		return s
+	}
+	return runewidth.Truncate(s, n, "")
+}
+
+// overlayCenter composites the fg box centered ON TOP of the bg view, so the
+// menu pops up over the still-visible container list instead of a blank screen.
+// ANSI- and wide-char-aware: keeps the background showing around the box.
+func overlayCenter(bg, fg string, totalW, totalH int) string {
+	bgLines := strings.Split(bg, "\n")
+	for len(bgLines) < totalH {
+		bgLines = append(bgLines, "")
+	}
+	fgLines := strings.Split(strings.TrimRight(fg, "\n"), "\n")
+	fgW := 0
+	for _, l := range fgLines {
+		if x := ansi.StringWidth(l); x > fgW {
+			fgW = x
+		}
+	}
+	startRow := (totalH - len(fgLines)) / 2
+	if startRow < 0 {
+		startRow = 0
+	}
+	startCol := (totalW - fgW) / 2
+	if startCol < 0 {
+		startCol = 0
+	}
+	for i, fl := range fgLines {
+		row := startRow + i
+		if row < 0 || row >= len(bgLines) {
+			continue
+		}
+		bl := bgLines[row]
+		if x := ansi.StringWidth(bl); x < totalW {
+			bl += strings.Repeat(" ", totalW-x)
+		}
+		left := ansi.Truncate(bl, startCol, "")
+		right := ansi.TruncateLeft(bl, startCol+ansi.StringWidth(fl), "")
+		bgLines[row] = left + fl + right
+	}
+	return strings.Join(bgLines, "\n")
 }
 
 // ── Key handling ─────────────────────────────────────────────────────────────

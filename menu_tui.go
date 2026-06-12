@@ -560,10 +560,10 @@ func (m menuModel) View() string {
 
 	view := b.String()
 
-	// Popup = a centered modal over the screen (like the Python menu), instead
-	// of glued to the bottom under everything.
+	// Popup = a snug box composited ON TOP of the live screen, so the container
+	// list stays visible behind it (not a blank modal).
 	if m.popup != nil {
-		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.popup.render(m.width))
+		return overlayCenter(view, m.popup.render(m.width), m.width, m.height)
 	}
 	return view
 }
