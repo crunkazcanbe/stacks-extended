@@ -983,6 +983,8 @@ var tuiContainerActions = []tuiAction{
 	// popup, inserted above, which toggles per-container with no compose edits)
 	{"↑  Proxy ON", "proxy_on"},
 	{"↓  Proxy OFF", "proxy_off"},
+	{"⌨   Open Terminal (shell in container)", "open_term"},
+	{"📝  Open compose in default editor", "open_editor"},
 	{"🔍  Inspect", "inspect"},
 	{"⏪  Rollback image…", "rollback"},
 	{"🌐  Edit IP", "edit_ip"},
@@ -1051,6 +1053,19 @@ func (m menuModel) doContainerAction(name, stackFile, action string) (menuModel,
 	switch action {
 	case "", "cancel":
 		return m, nil
+	case "open_term":
+		return m, tuiExecShell(name)
+	case "open_editor":
+		f := stackFile
+		if f == "" {
+			f = stackFileFor(stackName)
+		}
+		if f == "" {
+			m.popup = tuiOutputPopup("Open in editor",
+				[]string{name + " has no compose file we can find — nothing to open."})
+			return m, nil
+		}
+		return m, tuiEditFile(f)
 	case "zeroscale":
 		return m.openZeroScalePopup(name)
 	case "reclaim_menu":
@@ -1430,6 +1445,7 @@ var tuiStackActions = []tuiAction{
 	{"↓  Scale OFF", "scale_off"},
 	{"↑  Proxy ON", "proxy_on"},
 	{"↓  Proxy OFF", "proxy_off"},
+	{"📝  Open compose in default editor", "open_editor"},
 	{"🎨  Art Inject", "art_inject"},
 	{"🧹  Art Strip", "art_strip"},
 	{"🛠  Build service into this stack…", "build_into"},
@@ -1482,6 +1498,14 @@ func (m menuModel) doStackAction(name, action string) (menuModel, tea.Cmd) {
 	switch action {
 	case "", "cancel":
 		return m, nil
+	case "open_editor":
+		f := stackFileFor(name)
+		if f == "" {
+			m.popup = tuiOutputPopup("Open in editor",
+				[]string{"No compose file found for stack " + name + "."})
+			return m, nil
+		}
+		return m, tuiEditFile(f)
 	case "build_into":
 		return m.doBuildAction("build_into")
 	case "reclaim_menu":
@@ -2645,17 +2669,72 @@ func tuiSelfCmd(title string, args ...string) tea.Cmd {
 	return tuiShellCmd(title, selfExe(), args...)
 }
 
-// tuiEditFile suspends the TUI, opens path in $EDITOR (nano fallback), then
-// resumes — mirrors the Python menu's "open in $EDITOR" on Configs/Art/Network.
+// tuiEditFile suspends the TUI, opens path in the default editor, then resumes.
+// Editor preference: STACKS_EDITOR (stacks.conf) → $EDITOR → $VISUAL → nano.
 func tuiEditFile(path string) tea.Cmd {
-	ed := os.Getenv("EDITOR")
+	if path == "" {
+		return func() tea.Msg {
+			return tuiActionDoneMsg{title: "Edit", output: "No file to open for this item."}
+		}
+	}
+	ed := confValue("STACKS_EDITOR")
+	if ed == "" {
+		ed = os.Getenv("EDITOR")
+	}
 	if ed == "" {
 		ed = os.Getenv("VISUAL")
 	}
 	if ed == "" {
 		ed = "nano"
 	}
-	return tea.ExecProcess(exec.Command(ed, path), func(error) tea.Msg { return nil })
+	// honor an editor set as "code --wait" etc. by splitting on spaces
+	fields := strings.Fields(ed)
+	args := append(fields[1:], path)
+	return tea.ExecProcess(exec.Command(fields[0], args...), func(error) tea.Msg { return nil })
+}
+
+// tuiExecShell suspends the TUI and opens an interactive shell INSIDE the
+// container — bash if the image has it, otherwise sh — so she can type commands
+// and "do stuff". On exit (Ctrl-D / `exit`) the menu comes right back. This is
+// the "Open Terminal" action. If the container isn't running it falls back to a
+// throwaway `docker run` of the image so there's still a prompt to poke around.
+func tuiExecShell(name string) tea.Cmd {
+	if name == "" {
+		return func() tea.Msg {
+			return tuiActionDoneMsg{title: "Terminal", output: "No container selected."}
+		}
+	}
+	inner := "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi"
+	c := exec.Command("docker", "exec", "-it", name, "sh", "-c", inner)
+	c.Env = dockerEnv()
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		if err != nil {
+			return tuiActionDoneMsg{title: "Terminal: " + name,
+				output: "Could not open a shell in " + name + " — is it running?\n" + err.Error()}
+		}
+		return nil
+	})
+}
+
+// stackFileFor resolves a stack's compose file by name: the configured
+// stacks dir first, otherwise the real path from the live container's Docker
+// compose labels (so a stack with no file in STACKS_DIR still opens where it
+// actually lives). Returns "" if nothing is found.
+func stackFileFor(name string) string {
+	if name == "" {
+		return ""
+	}
+	if p := filepath.Join(stacksDir(), name+".yml"); fileExists(p) {
+		return p
+	}
+	for _, ci := range containerInfo() {
+		if ci.Project == name {
+			if f := composeFileFromLabels(ci.Config, ci.WorkDir); f != "" {
+				return f
+			}
+		}
+	}
+	return ""
 }
 
 // tuiExecSelf suspends the TUI and runs `stacks <args…>` INTERACTIVELY (shares
@@ -2951,32 +3030,58 @@ func (m menuModel) handleSettingsKey(k string) (tea.Model, tea.Cmd) {
 	switch k {
 	case "up", "k", "down", "j", "pgup", "pgdown", "home", "end":
 		m.moveCursor(k, len(items))
+	case "e", "E":
+		// quick key: open the whole stacks.conf in the editor
+		return m, tuiEditFile(tuiSettingsConf())
 	case "enter":
 		if len(items) == 0 {
 			return m, nil
 		}
 		it := items[m.sel]
+		// Enter opens a small action menu so editing is DISCOVERABLE (no hidden
+		// keys): change the value, toggle a 0/1, or open stacks.conf in $EDITOR.
+		acts := []tuiAction{}
 		if it.Val == "0" || it.Val == "1" {
-			nv := "1"
-			if it.Val == "1" {
-				nv = "0"
-			}
-			tuiSettingsSave(it.Key, nv)
-		} else {
-			prompt := it.Desc
-			if prompt == "" {
-				prompt = "Value:"
-			}
-			m.popup = tuiInputPopup("Edit "+it.Key, truncate(prompt, 46), it.Val,
-				func(nv string) (menuModel, tea.Cmd) {
-					if nv != it.Val {
-						tuiSettingsSave(it.Key, nv)
-					}
-					return m, nil
-				})
+			acts = append(acts, tuiAction{"⇄  Toggle (" + it.Val + " → " + flip01(it.Val) + ")", "toggle"})
 		}
+		acts = append(acts,
+			tuiAction{"✎  Edit value…", "edit"},
+			tuiAction{"📝  Open stacks.conf in default editor", "open_editor"},
+			tuiAction{"✕  Cancel", ""},
+		)
+		m.popup = tuiActionPopup("Setting: "+truncate(it.Key, 30), acts,
+			func(action string) (menuModel, tea.Cmd) {
+				switch action {
+				case "toggle":
+					tuiSettingsSave(it.Key, flip01(it.Val))
+				case "edit":
+					prompt := it.Desc
+					if prompt == "" {
+						prompt = "Value:"
+					}
+					m.popup = tuiInputPopup("Edit "+it.Key, truncate(prompt, 46), it.Val,
+						func(nv string) (menuModel, tea.Cmd) {
+							if nv != it.Val {
+								tuiSettingsSave(it.Key, nv)
+							}
+							return m, nil
+						})
+					return m, nil
+				case "open_editor":
+					return m, tuiEditFile(tuiSettingsConf())
+				}
+				return m, nil
+			})
 	}
 	return m, nil
+}
+
+// flip01 returns the toggled value of a "0"/"1" string.
+func flip01(v string) string {
+	if v == "1" {
+		return "0"
+	}
+	return "1"
 }
 
 // ===== from menu_keys.go =====
@@ -3669,6 +3774,7 @@ func (m menuModel) renderDynamics() string {
 }
 
 var tuiDynActions = []tuiAction{
+	{"📝  Open with default editor", "open_editor"},
 	{"🎨  Art Inject", "art_inject"},
 	{"🧹  Art Strip", "art_strip"},
 	{"🔧  Repair", "repair"},
@@ -3710,6 +3816,8 @@ func (m menuModel) doDynamicsAction(r tuiDynRow, action string) (menuModel, tea.
 	switch action {
 	case "", "cancel":
 		return m, nil
+	case "open_editor":
+		return m, tuiEditFile(r.Path)
 	case "art_inject":
 		return m, tuiSelfCmd("Art inject "+r.Stack, "art", "dynamic", "inject", r.Path)
 	case "art_strip":
