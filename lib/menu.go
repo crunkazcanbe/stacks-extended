@@ -50,6 +50,7 @@ var (
 const (
 	tabContainers = iota
 	tabStacks
+	tabFamilies
 	tabLogs
 	tabDynamics
 	tabArt
@@ -63,7 +64,7 @@ const (
 )
 
 var tuiTabs = []string{
-	"Containers", "Stacks", "Logs", "Dynamics", "Art", "Backup",
+	"Containers", "Stacks", "Families", "Logs", "Dynamics", "Art", "Backup",
 	"Build", "Configs", "Network", "Updates", "Settings", "Upgrade",
 }
 
@@ -623,6 +624,8 @@ func (m menuModel) View() string {
 		body = m.renderContainers()
 	case tabStacks:
 		body = m.renderStacks()
+	case tabFamilies:
+		body = m.renderFamilies()
 	case tabLogs:
 		body = m.renderLogs()
 	case tabDynamics:
@@ -666,6 +669,8 @@ func (m menuModel) footerHints() []string {
 		return []string{"↑↓ Nav", "←→ Tabs", "a-z Jump", "/ Search", "ENTER Menu", "q Quit"}
 	case tabStacks:
 		return []string{"↑↓ Nav", "←→ Tabs", "a-z Jump", "/ Search", "ENTER 1-Stack", "* ALL-Stacks", "q Quit"}
+	case tabFamilies:
+		return []string{"↑↓ Nav", "←→ Tabs", "n New", "ENTER Actions", "q Quit"}
 	case tabLogs:
 		return []string{"↑↓ Nav", "ENTER View", "←→ Tabs", "q Quit"}
 	case tabDynamics:
@@ -1676,6 +1681,7 @@ const (
 	tuiPopupInput                       // text input -> onSubmit(text)
 	tuiPopupOutput                      // read-only output, any key closes
 	tuiPopupDetail                      // scrollable read-only detail
+	tuiPopupMulti                       // scrollable checkbox multi-select -> onMulti(selected)
 )
 
 // tuiAction is one selectable row: a label and an opaque value.
@@ -1701,10 +1707,15 @@ type tuiPopup struct {
 	lines     []string
 	lineScrol int
 
+	// multi-select (checkbox list): items + which are ticked
+	items    []string
+	selected map[string]bool
+
 	// callbacks (executed by the model; may return a tea.Cmd)
 	onSelect  func(value string) (menuModel, tea.Cmd)
 	onConfirm func() (menuModel, tea.Cmd)
 	onSubmit  func(text string) (menuModel, tea.Cmd)
+	onMulti   func(selected []string) (menuModel, tea.Cmd)
 }
 
 // ── Rendering ────────────────────────────────────────────────────────────────
@@ -1835,6 +1846,42 @@ func (p *tuiPopup) render(width int) string {
 		} else {
 			body("any key / ESC to close")
 		}
+
+	case tuiPopupMulti:
+		vis := 14
+		end := p.scroll + vis
+		if end > len(p.items) {
+			end = len(p.items)
+		}
+		for i := p.scroll; i < end; i++ {
+			box := "[ ]"
+			if p.selected[p.items[i]] {
+				box = "[x]"
+			}
+			label := vtrunc(box+" "+p.items[i], w-6)
+			if i == p.sel {
+				b.WriteString(tuiPopupBorder.Render("║"))
+				b.WriteString(" " + tuiPopupSel.Render(padRight("  "+label, w-4)) + " ")
+				b.WriteString(tuiPopupBorder.Render("║"))
+				b.WriteString("\n")
+			} else {
+				body("  " + label)
+			}
+		}
+		if p.scroll > 0 {
+			body("▲ more above")
+		}
+		if end < len(p.items) {
+			body("▼ more below")
+		}
+		n := 0
+		for _, v := range p.selected {
+			if v {
+				n++
+			}
+		}
+		body("")
+		body(fmt.Sprintf("SPACE toggle  ENTER save (%d picked)  ESC cancel", n))
 	}
 
 	b.WriteString(tuiPopupBorder.Render(bot))
@@ -2021,6 +2068,56 @@ func (m menuModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				p.lineScrol = len(p.lines) - 1
 			}
 		default:
+			m.popup = nil
+		}
+		return m, nil
+
+	case tuiPopupMulti:
+		switch k {
+		case "up", "k":
+			if p.sel > 0 {
+				p.sel--
+			}
+			if p.sel < p.scroll {
+				p.scroll = p.sel
+			}
+		case "down", "j":
+			if p.sel < len(p.items)-1 {
+				p.sel++
+			}
+			if p.sel >= p.scroll+14 {
+				p.scroll = p.sel - 13
+			}
+		case "pgup":
+			p.sel -= 14
+			if p.sel < 0 {
+				p.sel = 0
+			}
+			p.scroll = p.sel
+		case "pgdown":
+			p.sel += 14
+			if p.sel > len(p.items)-1 {
+				p.sel = len(p.items) - 1
+			}
+		case " ", "space", "x":
+			if len(p.items) > 0 {
+				it := p.items[p.sel]
+				p.selected[it] = !p.selected[it]
+			}
+		case "enter":
+			var picked []string
+			for _, it := range p.items { // preserve list order
+				if p.selected[it] {
+					picked = append(picked, it)
+				}
+			}
+			cb := p.onMulti
+			m.popup = nil
+			if cb != nil {
+				return cb(picked)
+			}
+			return m, nil
+		case "esc", "q", "ctrl+c":
 			m.popup = nil
 		}
 		return m, nil
@@ -3200,6 +3297,8 @@ func (m menuModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleContainersKey(k)
 	case tabStacks:
 		return m.handleStacksKey(k)
+	case tabFamilies:
+		return m.handleFamiliesKey(k)
 	case tabLogs:
 		return m.handleLogsKey(k)
 	case tabDynamics:
