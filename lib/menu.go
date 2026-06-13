@@ -97,6 +97,7 @@ type tuiData struct {
 	Stacks     []tuiStack
 	MemStats   map[string]string // container -> "used / limit"
 	ImgSizes   map[string]string // image -> size string
+	ZeroScale  map[string]bool   // container -> Zero Scale wake-on-visit enabled
 	Net        *tuiNetData       // IP/port collision scan (heavy — done in bg collect, not in render)
 	LastUpdate time.Time
 }
@@ -124,7 +125,17 @@ func tuiCollect() tuiData {
 	d := tuiData{
 		MemStats:   map[string]string{},
 		ImgSizes:   map[string]string{},
+		ZeroScale:  map[string]bool{},
 		LastUpdate: time.Now(),
+	}
+
+	// Zero Scale enabled set: every container of an enabled wake-on-visit site.
+	for _, s := range loadZSConfig().Sites {
+		if s.Enabled == nil || *s.Enabled {
+			for _, cn := range s.Containers {
+				d.ZeroScale[cn] = true
+			}
+		}
 	}
 
 	// Image sizes (image:tag -> human size).
@@ -587,7 +598,7 @@ func (m menuModel) View() string {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	title := fmt.Sprintf("  ✦ STACKS  ·  %d/%d running  ·  %s  ", nr, len(m.data.Containers), now.Format("15:04:05"))
+	title := fmt.Sprintf("  ✦ STACKS  ·  %d running / %d total  ·  %s  ", nr, len(m.data.Containers), now.Format("15:04:05"))
 	b.WriteString(tuiHeaderStyle.Width(m.width).Render(tuiCenter(title, m.width)))
 	b.WriteString("\n")
 
@@ -840,7 +851,7 @@ func (m menuModel) renderContainers() string {
 		// clamp handled in key handler; guard here too
 	}
 	var b strings.Builder
-	header := fmt.Sprintf("  %-26s %-12s %-10s %-19s %-9s %s", "NAME", "STACK", "STATUS", "MEMORY", "CACHE", "IMAGE")
+	header := fmt.Sprintf("  %-26s %-12s %-10s %-8s %-19s %-9s %s", "NAME", "STACK", "STATUS", "0-SCALE", "MEMORY", "CACHE", "IMAGE")
 	b.WriteString(tuiAccentStyle.Render(header))
 	b.WriteString("\n")
 	b.WriteString(tuiDimStyle.Render("  " + strings.Repeat("─", maxInt(0, m.width-4))))
@@ -863,8 +874,13 @@ func (m menuModel) renderContainers() string {
 		name := truncate(c.Name, 26)
 		stack := truncate(c.Stack, 12)
 		status := truncate(c.Status, 10)
-		image := truncate(c.Image, maxInt(0, m.width-85))
-		line := fmt.Sprintf("%s %-26s %-12s %-10s %-19s %-9s %s", ind, name, stack, status, mem, szCell, image)
+		zsOn := m.data.ZeroScale[c.Name]
+		zsCell := "—"
+		if zsOn {
+			zsCell = "ON"
+		}
+		image := truncate(c.Image, maxInt(0, m.width-93))
+		line := fmt.Sprintf("%s %-26s %-12s %-10s %-8s %-19s %-9s %s", ind, name, stack, status, zsCell, mem, szCell, image)
 		if i == m.sel {
 			b.WriteString(tuiSelectedStyle.Render(truncate(line, m.width-2)))
 		} else {
@@ -876,10 +892,15 @@ func (m menuModel) renderContainers() string {
 			if cached {
 				szStyle = tuiCyanStyle
 			}
+			zsStyle := tuiDimStyle
+			if zsOn {
+				zsStyle = tuiGreenStyle
+			}
 			b.WriteString(indStyle.Render(ind) + " ")
 			b.WriteString(tuiNormalStyle.Render(fmt.Sprintf("%-26s ", name)))
 			b.WriteString(tuiGreenStyle.Render(fmt.Sprintf("%-12s ", stack)))
 			b.WriteString(tuiDimStyle.Render(fmt.Sprintf("%-10s ", status)))
+			b.WriteString(zsStyle.Render(fmt.Sprintf("%-8s ", zsCell)))
 			b.WriteString(tuiYellowStyle.Render(fmt.Sprintf("%-19s ", mem)))
 			b.WriteString(szStyle.Render(fmt.Sprintf("%-9s ", szCell)))
 			b.WriteString(tuiDimStyle.Render(image))

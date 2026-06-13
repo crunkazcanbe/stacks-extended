@@ -136,8 +136,24 @@ func strategyArgs(stack, strategy string) []string {
 	}
 }
 
-// runStrategy re-invokes the stacks binary to apply one strategy to one stack.
+// restartStack is the CHEAPEST heal: docker restart every container in the stack
+// (running OR exited). It clears a wedged app that Docker still calls "running"
+// but that has stopped serving its web page — the common case — without the cost
+// of a repair/recreate/fix. It also starts a container that has exited.
+func restartStack(stack string) {
+	for name := range stackContainerStates(stack, true) {
+		_ = exec.Command("docker", "restart", "-t", "10", name).Run()
+	}
+}
+
+// runStrategy applies one strategy to one stack. "restart" is handled inline
+// (a plain docker restart); every other strategy re-invokes the stacks binary so
+// we reuse the program's own tested up/repair/recreate/fix.
 func runStrategy(stack, strategy string) {
+	if strings.ToLower(strategy) == "restart" {
+		restartStack(stack)
+		return
+	}
 	args := strategyArgs(stack, strategy)
 	cmd := exec.Command(selfBin(), args...)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
@@ -185,8 +201,27 @@ func stackHealthy(stack string) bool {
 	return true
 }
 
-// applyTo runs the gentle strategy then (force OR unhealthy) escalates in order.
-func applyTo(stack, strategy string, escalate, force bool, escalation []string) {
+// healthOK is the escalation gate. A stack is OK only if its containers aren't
+// thrashing AND — when site-checking is on — its web page actually serves. This
+// is the whole point: a container can be "running" while its site is wedged
+// (errors/502/won't connect). Escalation must keep climbing until the PAGE is
+// back, not stop the moment Docker says "running". A short settle gives the app
+// time to bind its port after a restart/recreate before we probe the site.
+func healthOK(stack string, siteCheck bool, cfg map[string]string) bool {
+	if !stackHealthy(stack) {
+		return false
+	}
+	if !siteCheck {
+		return true
+	}
+	time.Sleep(4 * time.Second) // let the app bind before probing the page
+	return stackSiteOK(stack, cfg)
+}
+
+// applyTo runs the gentle strategy then (force OR not-yet-OK) escalates in order.
+// When siteCheck is on, "OK" means the web page serves, so escalation continues
+// restart→repair→recreate→fix until the site is actually back (or steps run out).
+func applyTo(stack, strategy string, escalate, force bool, escalation []string, siteCheck bool, cfg map[string]string) {
 	fmt.Printf("\x1b[1;36m▸ %s\x1b[0m  (%s)\n", stack, strategy)
 	runStrategy(stack, strategy)
 	if force {
@@ -200,16 +235,20 @@ func applyTo(stack, strategy string, escalate, force bool, escalation []string) 
 		return
 	}
 	for _, step := range escalation {
-		if stackHealthy(stack) {
+		if healthOK(stack, siteCheck, cfg) {
 			return
 		}
-		fmt.Printf("  \x1b[33m↑ %s unhealthy → %s\x1b[0m\n", stack, step)
+		why := "unhealthy"
+		if siteCheck {
+			why = "still not serving"
+		}
+		fmt.Printf("  \x1b[33m↑ %s %s → %s\x1b[0m\n", stack, why, step)
 		runStrategy(stack, step)
 	}
 }
 
 // parallelApply runs applyTo across stacks, `parallel` at a time.
-func parallelApply(stacks []string, parallel int, strategy string, escalate, force bool, escalation []string) {
+func parallelApply(stacks []string, parallel int, strategy string, escalate, force bool, escalation []string, siteCheck bool, cfg map[string]string) {
 	sem := make(chan struct{}, parallel)
 	var wg sync.WaitGroup
 	for _, s := range stacks {
@@ -218,7 +257,7 @@ func parallelApply(stacks []string, parallel int, strategy string, escalate, for
 		go func(stack string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			applyTo(stack, strategy, escalate, force, escalation)
+			applyTo(stack, strategy, escalate, force, escalation, siteCheck, cfg)
 		}(s)
 	}
 	wg.Wait()
@@ -248,7 +287,8 @@ func runBoot() {
 	//       the option off cleanly undoes a previous override.
 	bootApplyDockerRestart(bc.stacks, bc.overrideDocker)
 
-	parallelApply(bc.stacks, bc.parallel, bc.strategy, bc.escalate, bc.force, bc.escalation)
+	bootCfg := configLoad()
+	parallelApply(bc.stacks, bc.parallel, bc.strategy, bc.escalate, bc.force, bc.escalation, false, bootCfg)
 
 	if bc.downloadMissing {
 		bootDownloadMissing(bc.stacks)
@@ -287,7 +327,7 @@ func runBoot() {
 		}
 		if len(broken) > 0 {
 			parallelApply(broken, bc.parallel, bc.watchStrategy,
-				bc.watchEscalate, bc.watchForce, bc.watchEscalation)
+				bc.watchEscalate, bc.watchForce, bc.watchEscalation, true, cfg)
 		} else {
 			fmt.Println("\x1b[32m  all boot sites serving ✔\x1b[0m")
 		}
@@ -509,20 +549,283 @@ func siteOK(host string, cfg map[string]string) bool {
 	return strings.Contains(","+ok+",", ","+code+",")
 }
 
-// stackSiteOK checks ONE representative host of the stack (the primary site).
-func stackSiteOK(stack string, cfg map[string]string) bool {
-	hosts := stackHosts(stack, cfg)
-	if len(hosts) == 0 {
-		return true // no public site → nothing to check, don't flag it
+// dynHostContainers parses a stack's Traefik file-provider dynamics into a
+// host→backing-container map (router.rule Host(`x`) → router.service → that
+// service's loadBalancer url http://CONTAINER:port). This is what lets the
+// watchdog tell a genuinely-wedged site (its container is RUNNING but the page is
+// dead) apart from a Zero-Scale/Sablier sleeper (its container is intentionally
+// STOPPED, so a 502 is expected). Universal-ish: it's the standard file-provider
+// shape Bellz uses; label-provider hosts fall back to the stack-level check.
+func dynHostContainers(stack string, cfg map[string]string) map[string]string {
+	dir := cfg["DYNAMICS_DIR"]
+	if dir == "" {
+		dir = filepath.Join(stacksDir(), "..", "Configs", "Dynamics")
 	}
-	return siteOK(hosts[0], cfg)
+	data, err := os.ReadFile(filepath.Join(dir, stack+".yml"))
+	if err != nil {
+		return nil
+	}
+	type rtr struct {
+		hosts []string
+		svc   string
+	}
+	var routers []rtr
+	svcContainer := map[string]string{}
+	urlRe := regexp.MustCompile(`https?://([A-Za-z0-9_.-]+)`)
+	section := "" // "routers" | "services"
+	cur := -1     // index into routers for the router currently being parsed
+	curSvc := ""
+	for _, ln := range strings.Split(string(data), "\n") {
+		trim := strings.TrimSpace(ln)
+		if trim == "" || strings.HasPrefix(trim, "#") {
+			continue
+		}
+		indent := len(ln) - len(strings.TrimLeft(ln, " "))
+		if indent <= 2 && strings.HasSuffix(trim, ":") { // section header (routers:/services:/http:)
+			switch strings.TrimSuffix(trim, ":") {
+			case "routers":
+				section, cur = "routers", -1
+			case "services":
+				section, curSvc = "services", ""
+			case "http", "tcp", "udp":
+				// container key — keep current section context
+			default:
+				section = ""
+			}
+			continue
+		}
+		if indent == 4 && strings.HasSuffix(trim, ":") { // a router name / service name
+			name := strings.TrimSuffix(trim, ":")
+			if section == "routers" {
+				routers = append(routers, rtr{})
+				cur = len(routers) - 1
+			} else if section == "services" {
+				curSvc = name
+			}
+			continue
+		}
+		switch section {
+		case "routers":
+			if cur < 0 {
+				continue
+			}
+			if strings.HasPrefix(trim, "rule:") {
+				routers[cur].hosts = extractHosts(trim)
+			} else if strings.HasPrefix(trim, "service:") {
+				routers[cur].svc = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trim, "service:")), `"'`)
+			}
+		case "services":
+			if curSvc == "" {
+				continue
+			}
+			if m := urlRe.FindStringSubmatch(trim); m != nil {
+				if _, ok := svcContainer[curSvc]; !ok {
+					svcContainer[curSvc] = m[1]
+				}
+			}
+		}
+	}
+	out := map[string]string{}
+	for _, r := range routers {
+		if c := svcContainer[r.svc]; c != "" {
+			for _, h := range r.hosts {
+				out[h] = c
+			}
+		}
+	}
+	return out
+}
+
+// (containerRunning lives in zeroscale.go — reused here.)
+
+// wedgedSites returns the containers of a stack that are RUNNING yet whose public
+// page does not serve — exactly the "up but won't connect / throwing errors"
+// failure. Containers that are STOPPED are skipped (parked Zero-Scale sleepers →
+// a 502 is expected; the watchdog must never wake them). One host per container is
+// probed (representative).
+func wedgedSites(stack string, cfg map[string]string) []string {
+	hc := dynHostContainers(stack, cfg)
+	if len(hc) == 0 {
+		// no file-provider map (label-provider / no dynamics) → fall back to the
+		// simple primary-host check, but still respect "no host = nothing to do"
+		hosts := stackHosts(stack, cfg)
+		if len(hosts) == 0 || siteOK(hosts[0], cfg) {
+			return nil
+		}
+		return []string{stack}
+	}
+	checked := map[string]bool{}
+	var wedged []string
+	for host, cont := range hc {
+		if checked[cont] {
+			continue
+		}
+		checked[cont] = true
+		if !containerRunning(cont) {
+			continue // parked/sleeping on purpose → leave to Zero Scale
+		}
+		if !siteOK(host, cfg) {
+			wedged = append(wedged, cont)
+		}
+	}
+	return wedged
+}
+
+// stackSiteOK is true when none of the stack's RUNNING-backed sites are wedged.
+func stackSiteOK(stack string, cfg map[string]string) bool {
+	return len(wedgedSites(stack, cfg)) == 0
+}
+
+// dynSvcURLRe captures scheme + container + port from a Traefik service url, e.g.
+// http://qbittorrent:8280  →  ("http","qbittorrent","8280").
+var dynSvcURLRe = regexp.MustCompile(`(https?)://([A-Za-z0-9_.-]+):(\d+)`)
+
+// dynContainerPorts maps container name → {scheme, port} from a stack's Traefik
+// service loadBalancer urls. This is the container's OWN internal endpoint — what
+// lets the watchdog probe the app directly (container IP:port) instead of through
+// the public edge, so an edge/cert/Pangolin 5xx is never mistaken for a sick app.
+func dynContainerPorts(stack string, cfg map[string]string) map[string][2]string {
+	dir := cfg["DYNAMICS_DIR"]
+	if dir == "" {
+		dir = filepath.Join(stacksDir(), "..", "Configs", "Dynamics")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, stack+".yml"))
+	if err != nil {
+		return nil
+	}
+	out := map[string][2]string{}
+	for _, m := range dynSvcURLRe.FindAllStringSubmatch(string(data), -1) {
+		scheme, cont, port := m[1], m[2], m[3]
+		if _, seen := out[cont]; !seen { // first url for a container wins
+			out[cont] = [2]string{scheme, port}
+		}
+	}
+	return out
+}
+
+// containerServes probes a container's OWN web endpoint directly (its docker IP +
+// the internal port Traefik routes to) and reports whether it answers acceptably.
+// Returns true when we can't determine an IP (don't flag what we can't see).
+func containerServes(name, scheme, port string, cfg map[string]string) bool {
+	out, _ := exec.Command("docker", "inspect", "-f",
+		`{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}`, name).Output()
+	ips := strings.Fields(string(out))
+	if len(ips) == 0 {
+		return true
+	}
+	to := cfg["WATCH_SITE_TIMEOUT"]
+	if to == "" {
+		to = "8"
+	}
+	ok := cfg["WATCH_SITE_OK_CODES"]
+	if ok == "" {
+		ok = "200,204,301,302,307,308,401,403,405"
+	}
+	code, _ := exec.Command("curl", "-sk", "-m", to, "-o", "/dev/null",
+		"-w", "%{http_code}", scheme+"://"+ips[0]+":"+port+"/").Output()
+	cc := strings.TrimSpace(string(code))
+	if cc == "" || cc == "000" {
+		return false // refused / timed out → the app itself isn't answering
+	}
+	return strings.Contains(","+ok+",", ","+cc+",")
+}
+
+// bootYamlList reads a top-level string list (key:) out of boot.yaml. Parsed
+// without a YAML dep so it can't drag in surprises.
+func bootYamlList(key string) []string {
+	data, err := os.ReadFile(filepath.Join(configDir(), "boot.yaml"))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	inList := false
+	for _, raw := range strings.Split(string(data), "\n") {
+		ln := strings.TrimRight(raw, "\r")
+		if strings.HasPrefix(ln, key+":") {
+			inList = true
+			continue
+		}
+		if !inList {
+			continue
+		}
+		ts := strings.TrimSpace(ln)
+		switch {
+		case ts == "" || strings.HasPrefix(ts, "#"):
+			continue
+		case strings.HasPrefix(ts, "- "):
+			out = append(out, strings.Trim(strings.TrimSpace(ts[2:]), `"'`))
+		default:
+			return out // a new top-level key — this list ended
+		}
+	}
+	return out
+}
+
+// loadBossContainers = the BOOT list (what starts when the computer starts).
+func loadBossContainers() []string { return bootYamlList("boot_containers") }
+
+// loadWatchContainers = the WATCHDOG list (what stays alive 24/7). It's SEPARATE
+// from the boot list: set watch_containers: in boot.yaml to keep alive only a
+// subset of what boots. When it's not set, it falls back to the full boot list —
+// so by default the watchdog guards everything that starts.
+func loadWatchContainers() []string {
+	if w := bootYamlList("watch_containers"); len(w) > 0 {
+		return w
+	}
+	return bootYamlList("boot_containers")
+}
+
+// containerStackIndex maps a container name → the stack that owns it, so even a
+// DOWN or removed boss can be traced back to the stack that repairs/recreates it.
+// Stack-file container_name: declarations seed it (covers removed containers);
+// live compose labels then overwrite (authoritative for anything that exists).
+var ctrNameRe = regexp.MustCompile(`(?m)^\s*container_name:\s*["']?([A-Za-z0-9_.-]+)`)
+
+func containerStackIndex() map[string]string {
+	idx := map[string]string{}
+	for _, s := range dispStackList() {
+		f := stackFileFor(s)
+		if f == "" {
+			continue
+		}
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for _, m := range ctrNameRe.FindAllStringSubmatch(string(data), -1) {
+			idx[m[1]] = s
+		}
+	}
+	out, _ := exec.Command("docker", "ps", "-a", "--format",
+		`{{.Names}}` + "\t" + `{{.Label "com.docker.compose.project"}}`).Output()
+	for _, ln := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		name, proj, _ := strings.Cut(ln, "\t")
+		if name != "" && proj != "" {
+			idx[name] = proj
+		}
+	}
+	return idx
+}
+
+// hostForContainer returns a public hostname this container serves (if any), by
+// inverting the stack's Traefik host→container map.
+func hostForContainer(stack, container string, cfg map[string]string) string {
+	for h, c := range dynHostContainers(stack, cfg) {
+		if c == container {
+			return h
+		}
+	}
+	return ""
 }
 
 func cmdWatch(args []string) {
-	once := false
+	once, dryRun := false, false
 	for _, a := range args {
-		if a == "--once" || a == "once" {
+		switch a {
+		case "--once", "once":
 			once = true
+		case "--check", "--dry", "--dry-run", "check":
+			once, dryRun = true, true // one pass, report only, heal nothing
 		}
 	}
 	bc := loadBootConfig()
@@ -530,51 +833,130 @@ func cmdWatch(args []string) {
 		fmt.Println("watchdog disabled (watch_enabled=0) — exiting")
 		return
 	}
-	fmt.Printf("\x1b[1;32m🐶 Stacks watchdog\x1b[0m  every %ds, strategy=%s, %d stacks\n",
-		bc.watchInterval, bc.watchStrategy, len(bc.watchStacks))
-	// Anti-loop grace: after healing a stack, leave it alone for HEAL_GRACE
-	// seconds so it has time to come up before we touch it again. Seed every
-	// stack with "now" so the first grace window is a startup warmup.
+
+	// The watchdog guards the 24/7 BOSS LIST (boot.yaml boot_containers), container
+	// by container — not whole stacks. Each boss must stay running and, if it has a
+	// public page, keep serving it. Everything NOT on the list (Zero-Scale/Sablier
+	// sleepers) is left completely alone, so we never fight wake-on-visit. If the
+	// boss list is empty, fall back to every container in the watched stacks.
+	bossSource := "boss list"
+	bosses := loadWatchContainers()
+	if len(bosses) == 0 {
+		bossSource = "watched stacks"
+		seen := map[string]bool{}
+		for _, s := range bc.watchStacks {
+			for name := range stackContainerStates(s, true) {
+				if !seen[name] {
+					seen[name] = true
+					bosses = append(bosses, name)
+				}
+			}
+		}
+	}
+	fmt.Printf("\x1b[1;32m🐶 Stacks watchdog\x1b[0m  every %ds, watching %d containers (%s); site-check + restart→repair→recreate→fix\n",
+		bc.watchInterval, len(bosses), bossSource)
+
+	// Per-CONTAINER heal state: how far up the ladder we've escalated, and when we
+	// last touched it (grace/backoff). Seed grace with "now" = startup warmup.
+	attempts := map[string]int{}
 	lastHeal := map[string]time.Time{}
 	startNow := time.Now()
-	for _, s := range bc.watchStacks {
-		lastHeal[s] = startNow
+	for _, c := range bosses {
+		lastHeal[c] = startNow
 	}
+
 	for {
 		// reload config each sweep so Settings-tab edits take effect live
 		bc = loadBootConfig()
 		cfg := configLoad()
 		checkSites := cfgBoolKey(cfg, "WATCH_SITES", false)
 		grace := time.Duration(cfgInt(cfg, "HEAL_GRACE", 120)) * time.Second
-		// Auto-pull any missing images for the watched stacks, in the background,
-		// one at a time (WATCH_PULL_MISSING). Non-blocking — healing continues.
-		maybePullMissing(bc.watchStacks, cfg)
-		var down []string
-		for _, s := range bc.watchStacks {
-			if t, ok := lastHeal[s]; ok && time.Since(t) < grace {
-				continue // still in its grace window — leave it alone
-			}
-			if !stackHealthy(s) {
-				down = append(down, s)
+		// Once the full ladder is spent on a still-broken container (e.g. the VPN
+		// chain that can't come up for an external reason), back WAY off so we don't
+		// hammer it — retry only every WATCH_BACKOFF seconds.
+		backoff := time.Duration(cfgInt(cfg, "WATCH_BACKOFF", 1800)) * time.Second
+		// WATCH_SITE_SKIP: containers whose PAGE we never check (still kept running) —
+		// for sites whose errors aren't a container problem (e.g. an edge/cert issue),
+		// so the watchdog won't pointlessly escalate to fix and clobber manual tweaks.
+		siteSkip := map[string]bool{}
+		for _, n := range strings.Fields(cfg["WATCH_SITE_SKIP"]) {
+			siteSkip[n] = true
+		}
+		// refresh the boss list + name→stack index each sweep (Settings/boot.yaml live)
+		if b := loadWatchContainers(); len(b) > 0 {
+			bosses = b
+		}
+		idx := containerStackIndex()
+		// container → {scheme,port} of its OWN endpoint, gathered once per sweep from
+		// the dynamics of every stack a boss lives in. Used to probe apps directly
+		// (immune to edge/cert noise) rather than via the public URL.
+		endpoints := map[string][2]string{}
+		epDone := map[string]bool{}
+		for _, c := range bosses {
+			s := idx[c]
+			if s == "" || epDone[s] {
 				continue
 			}
-			// container is up but is the SITE actually serving? (catches 502/404
-			// where the app/route is broken even though docker says "running")
-			if checkSites && !stackSiteOK(s, cfg) {
-				fmt.Printf("\x1b[31m✘ %s: containers up but site not serving — healing\x1b[0m\n", s)
-				down = append(down, s)
+			epDone[s] = true
+			for cont, ep := range dynContainerPorts(s, cfg) {
+				endpoints[cont] = ep
 			}
 		}
-		if len(down) > 0 {
-			fmt.Printf("\x1b[33m… healing %d: %s\x1b[0m\n", len(down), strings.Join(down, " "))
-			parallelApply(down, bc.parallel, bc.watchStrategy,
-				bc.watchEscalate, bc.watchForce, bc.watchEscalation)
-			// stamp each healed stack so its grace window restarts — prevents a
-			// re-heal loop while the stack is still coming back up
-			now := time.Now()
-			for _, s := range down {
-				lastHeal[s] = now
+		// background, one-at-a-time pre-pull of any missing images for the stacks
+		maybePullMissing(bc.watchStacks, cfg)
+
+		for _, c := range bosses {
+			running := containerRunning(c)
+			// classify: "" = fine, "down" = not running, "wedged" = up but page dead.
+			// "wedged" probes the container's OWN endpoint (not the public URL) so an
+			// edge/cert/Pangolin 5xx can never be mistaken for a sick container.
+			reason := ""
+			if !running {
+				reason = "down"
+			} else if checkSites && !siteSkip[c] {
+				if ep, ok := endpoints[c]; ok && !containerServes(c, ep[0], ep[1], cfg) {
+					reason = "wedged"
+				}
 			}
+			if reason == "" {
+				if attempts[c] != 0 { // recovered → reset its counter
+					delete(attempts, c)
+				}
+				lastHeal[c] = time.Now() // healthy now → restart the grace clock
+				continue
+			}
+
+			// SAFE heal: ALWAYS a container-scoped `docker restart` — NEVER a
+			// stack-level repair/recreate/fix. Stack ops recreate sibling
+			// containers (e.g. healing crowdsec would recreate net_2 and take
+			// traefik down with it — that caused a real outage). A container
+			// can't take down its neighbours. After the first try, back off so a
+			// permanently-broken container isn't hammered; the heavier
+			// repair/recreate/fix stay MANUAL (menu/CLI) by design.
+			spent := attempts[c] >= 1
+			wait := grace
+			if spent {
+				wait = backoff
+			}
+			if !dryRun { // --check ignores grace so it reports the true current state
+				if t, ok := lastHeal[c]; ok && time.Since(t) < wait {
+					continue // still inside its grace/backoff window
+				}
+			}
+			stack := idx[c]
+			if dryRun {
+				fmt.Printf("\x1b[33m• would heal %s (%s): %s → restart\x1b[0m\n", c, stack, reason)
+				continue // report only — touch nothing
+			}
+			fmt.Printf("\x1b[31m✘ %s (%s): %s → restart\x1b[0m\n", c, stack, reason)
+			_ = exec.Command("docker", "restart", "-t", "10", c).Run()
+			lastHeal[c] = time.Now()
+			attempts[c]++
+		}
+
+		if dryRun {
+			fmt.Println("\x1b[36m(dry-run: nothing was changed)\x1b[0m")
+			return
 		}
 		if once {
 			return
