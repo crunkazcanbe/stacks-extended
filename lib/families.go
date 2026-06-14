@@ -128,7 +128,7 @@ func (m menuModel) renderFamilies() string {
 
 	if len(cfg.Families) == 0 {
 		b.WriteString("\n")
-		b.WriteString(tuiDimStyle.Render("  No families yet. Press n to create one (name + pick containers)."))
+		b.WriteString(tuiDimStyle.Render("  No families yet. Press n to create one (name + pick containers), or i to import a stack."))
 		b.WriteString("\n")
 		return b.String()
 	}
@@ -184,6 +184,8 @@ func (m menuModel) handleFamiliesKey(k string) (tea.Model, tea.Cmd) {
 		m.moveCursor(k, len(cfg.Families))
 	case "n", "N":
 		return m.openFamilyCreate()
+	case "i", "I":
+		return m.openFamilyImport()
 	case "enter", "tab":
 		if len(cfg.Families) == 0 {
 			return m.openFamilyCreate()
@@ -210,6 +212,52 @@ func (m menuModel) openFamilyCreate() (menuModel, tea.Cmd) {
 				return m, nil
 			}
 			return m.openFamilyPicker(name, nil)
+		})
+	return m, nil
+}
+
+// openFamilyImport turns an existing stack (compose project) into a family in two
+// steps: pick a stack, then confirm/tweak the auto-filled member list — so you
+// don't have to hand-check every container of e.g. the whole R-stack.
+func (m menuModel) openFamilyImport() (menuModel, tea.Cmd) {
+	byStack := map[string][]string{}
+	for _, c := range m.data.Containers {
+		if c.Stack != "" {
+			byStack[c.Stack] = append(byStack[c.Stack], c.Name)
+		}
+	}
+	if len(byStack) == 0 {
+		m.popup = tuiOutputPopup("Import stack", []string{"No stacks found to import from."})
+		return m, nil
+	}
+	var names []string
+	for s := range byStack {
+		names = append(names, s)
+	}
+	sort.Strings(names)
+	var acts []tuiAction
+	for _, s := range names {
+		acts = append(acts, tuiAction{fmt.Sprintf("%s  (%d containers)", truncate(s, 22), len(byStack[s])), s})
+	}
+	acts = append(acts, tuiAction{"✕  Cancel", "cancel"})
+	m.popup = tuiActionPopup("Import a stack as a family", acts,
+		func(stack string) (menuModel, tea.Cmd) {
+			if stack == "" || stack == "cancel" {
+				return m, nil
+			}
+			members := append([]string{}, byStack[stack]...)
+			sort.Strings(members)
+			// Prompt for the family name (pre-filled with the stack name), then
+			// open the picker pre-checked with the stack's containers.
+			m.popup = tuiInputPopup("Import "+truncate(stack, 20), "Family name:", stack,
+				func(name string) (menuModel, tea.Cmd) {
+					name = strings.TrimSpace(name)
+					if name == "" {
+						name = stack
+					}
+					return m.openFamilyPicker(name, members)
+				})
+			return m, nil
 		})
 	return m, nil
 }

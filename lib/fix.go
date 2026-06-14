@@ -2086,6 +2086,11 @@ func fxInjectGlobalKeys(lines []string, svc *fxService, gi map[string]string, dr
 	block := fxSliceClamp(lines, svc.blockStart, svc.blockEnd+1)
 	blockText := strings.Join(block, "\n")
 	whole := strings.Join(lines, "\n")
+	// Net-shared services (network_mode: service:x / container:x) share another
+	// container's network namespace — they must NOT get their own hostname or
+	// mac_address, which Docker rejects alongside a shared netns. (networks: is
+	// already guarded in fxSetNetworksAuthoritative.)
+	netShared := strings.Contains(blockText, "network_mode:")
 	if strings.Contains(blockText, "<<: *common-caps") || fxGIEnabled(fxGet(gi, "INJECT_COMMON_CAPS", "0")) {
 		if am := fxReXCommonCaps.FindString(whole); am != "" {
 			for _, m := range fxReAnchorKey.FindAllStringSubmatch(am, -1) {
@@ -2113,7 +2118,7 @@ func fxInjectGlobalKeys(lines []string, svc *fxService, gi map[string]string, dr
 			changes++
 		}
 	}
-	if fxGIEnabled(fxGet(gi, "INJECT_HOSTNAME", "0")) && !strings.Contains(blockText, "hostname:") {
+	if fxGIEnabled(fxGet(gi, "INJECT_HOSTNAME", "0")) && !netShared && !strings.Contains(blockText, "hostname:") {
 		inserts = append(inserts, "    hostname: "+svc.name)
 		changes++
 	}
@@ -2224,7 +2229,7 @@ func fxInjectGlobalKeys(lines []string, svc *fxService, gi map[string]string, dr
 		}
 	}
 
-	if fxGIEnabled(fxGet(gi, "INJECT_MAC", "0")) && !strings.Contains(blockText, "mac_address:") {
+	if fxGIEnabled(fxGet(gi, "INJECT_MAC", "0")) && !netShared && !strings.Contains(blockText, "mac_address:") {
 		sum := md5.Sum([]byte(svc.name))
 		h := hex.EncodeToString(sum[:])
 		inserts = append(inserts, fmt.Sprintf("    mac_address: 02:42:ac:11:%s:%s", h[0:2], h[2:4]))

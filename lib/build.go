@@ -1064,6 +1064,11 @@ func buildInject(stack, block, network, volume string) bool {
 		newLines = append(newLines, lines[insert:]...)
 		content = strings.Join(newLines, "")
 	}
+	// Tidy spacing so repeated builds never leave gaps: collapse any run of 2+
+	// blank lines down to a single blank line, and end the file with exactly one
+	// newline. (Double-blank lines are never meaningful in compose YAML.)
+	content = regexp.MustCompile(`\n{3,}`).ReplaceAllString(content, "\n\n")
+	content = strings.TrimRight(content, "\n") + "\n"
 	return os.WriteFile(fpath, []byte(content), 0644) == nil
 }
 
@@ -1097,6 +1102,20 @@ func buildSplitKeepEnds(s string) []string {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func cmdBuild(argv []string) {
+	// New default: the centered in-a-box wizard (matches the Python run_build_wizard
+	// look — everything inside one small box, no full-screen takeover). The old
+	// bottom-panel + full-screen-search flow is kept reachable with `--classic`.
+	classic := false
+	for _, a := range argv {
+		if a == "--classic" {
+			classic = true
+		}
+	}
+	if !classic {
+		cmdBuildBox(argv)
+		return
+	}
+
 	// args = [a for a in sys.argv[1:] if a not in ('--progress',) and not startswith('/tmp/')]
 	var args []string
 	for _, a := range argv {

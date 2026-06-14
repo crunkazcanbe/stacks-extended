@@ -409,6 +409,10 @@ type menuModel struct {
 	sel    int
 	scroll int
 
+	// Stacks tab: set of stack names currently expanded to reveal their
+	// child-container rows in the tree view.
+	stacksExpanded map[string]bool
+
 	// per-tab letter/inline filter (Containers, Updates)
 	fltLetter string // "" or "a".."z" or "#"
 	fltInline string
@@ -668,7 +672,7 @@ func (m menuModel) footerHints() []string {
 	case tabContainers:
 		return []string{"↑↓ Nav", "←→ Tabs", "a-z Jump", "/ Search", "ENTER Menu", "q Quit"}
 	case tabStacks:
-		return []string{"↑↓ Nav", "←→ Tabs", "a-z Jump", "/ Search", "ENTER 1-Stack", "* ALL-Stacks", "q Quit"}
+		return []string{"↑↓ Nav", "←→ Tabs", "SPACE Expand", "a-z Jump", "/ Search", "ENTER Menu", "* ALL", "q Quit"}
 	case tabFamilies:
 		return []string{"↑↓ Nav", "←→ Tabs", "n New", "ENTER Actions", "q Quit"}
 	case tabLogs:
@@ -686,7 +690,7 @@ func (m menuModel) footerHints() []string {
 	case tabNetwork:
 		return []string{"a Edit", "s Scan", "d Dedupe", "e YAML", "←→ Tabs", "q Quit"}
 	case tabUpdates:
-		return []string{"↑↓ Nav", "a-z Jump", "/ Search", "ENTER Detail", "C Check", "P Pull", "q Quit"}
+		return []string{"↑↓ Nav", "a-z Jump", "/ Search", "ENTER Detail", "c Check", "f Force", "p Pull", "q Quit"}
 	case tabSettings:
 		return []string{"↑↓ Nav", "ENTER Toggle/Edit", "←→ Tabs", "q Quit"}
 	case tabUpgrade:
@@ -1310,10 +1314,77 @@ func (m menuModel) filteredStacks() []tuiStack {
 	return out
 }
 
+// stackRow is one line of the Stacks tree: either a stack header row or an
+// indented child-container row under an expanded stack.
+type stackRow struct {
+	isChild bool
+	stack   tuiStack     // valid when !isChild
+	cont    tuiContainer // valid when isChild
+	parent  string       // owning stack name (child rows)
+}
+
+// containersInStack returns the live containers belonging to a stack, by name.
+func (m menuModel) containersInStack(name string) []tuiContainer {
+	var out []tuiContainer
+	for _, c := range m.data.Containers {
+		if c.Stack == name {
+			out = append(out, c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// stackTreeRows flattens the stacks (plus the children of expanded stacks) into
+// the display/selection list. The "/" inline search matches a stack by NAME or
+// by any of its CONTAINER names/images — a container-only match auto-expands
+// that stack and shows just the matching children (per-stack search). The A-Z
+// letter jump still keys off the stack name.
+func (m menuModel) stackTreeRows() []stackRow {
+	inline := strings.ToLower(strings.TrimSpace(m.fltInline))
+	var rows []stackRow
+	for _, s := range m.data.Stacks {
+		if m.fltLetter != "" && !tuiMatchLetter(s.Name, m.fltLetter) {
+			continue
+		}
+		nameMatch := inline == "" || strings.Contains(strings.ToLower(s.Name), inline)
+		kids := m.containersInStack(s.Name)
+		var matchKids []tuiContainer
+		if inline != "" {
+			for _, c := range kids {
+				if strings.Contains(strings.ToLower(c.Name), inline) ||
+					strings.Contains(strings.ToLower(c.Image), inline) {
+					matchKids = append(matchKids, c)
+				}
+			}
+		}
+		if inline != "" && !nameMatch && len(matchKids) == 0 {
+			continue
+		}
+		rows = append(rows, stackRow{stack: s})
+		switch {
+		case inline != "" && !nameMatch && len(matchKids) > 0:
+			// matched only via container(s) → reveal just the matches
+			for _, c := range matchKids {
+				rows = append(rows, stackRow{isChild: true, cont: c, parent: s.Name})
+			}
+		case m.stacksExpanded[s.Name]:
+			show := kids
+			if inline != "" && len(matchKids) > 0 {
+				show = matchKids
+			}
+			for _, c := range show {
+				rows = append(rows, stackRow{isChild: true, cont: c, parent: s.Name})
+			}
+		}
+	}
+	return rows
+}
+
 func (m menuModel) renderStacks() string {
-	items := m.filteredStacks()
+	rows := m.stackTreeRows()
 	var b strings.Builder
-	b.WriteString(tuiAccentStyle.Render("  [ * / A ] All-Stacks Actions"))
+	b.WriteString(tuiAccentStyle.Render("  [ * / A ] All-Stacks Actions") + tuiDimStyle.Render("   SPACE expand/collapse · ENTER menu"))
 	b.WriteString("\n")
 	header := fmt.Sprintf("  %-20s %-8s %-7s %-11s %-9s %s", "STACK", "RUN/T", "KB", "IMG C/T", "RAM", "STATUS")
 	b.WriteString(tuiYellowStyle.Render(header))
@@ -1326,11 +1397,17 @@ func (m menuModel) renderStacks() string {
 		vis = 1
 	}
 	end := m.scroll + vis
-	if end > len(items) {
-		end = len(items)
+	if end > len(rows) {
+		end = len(rows)
 	}
 	for i := m.scroll; i < end; i++ {
-		s := items[i]
+		r := rows[i]
+		if r.isChild {
+			b.WriteString(m.renderStackChildRow(r.cont, i == m.sel))
+			b.WriteString("\n")
+			continue
+		}
+		s := r.stack
 		missing := s.Total - s.Running - s.Stopped
 		status, stStyle := "● UP", tuiRunningStyle
 		if s.Running == 0 {
@@ -1358,12 +1435,21 @@ func (m menuModel) renderStacks() string {
 		}
 		imgCell := fmt.Sprintf("%d/%d", cached, len(s.Images))
 		ram := m.stackRAM(s)
-		name := truncate(s.Name, 20)
-		line := fmt.Sprintf("  %-20s %3d/%-4d %-7s %-11s %-9s %s", name, s.Running, s.Total, sizeStr, imgCell, ram, status)
+		// expand caret: ▾ open, ▸ closed (only if the stack has containers)
+		caret := " "
+		if len(m.containersInStack(s.Name)) > 0 {
+			if m.stacksExpanded[s.Name] {
+				caret = "▾"
+			} else {
+				caret = "▸"
+			}
+		}
+		name := truncate(s.Name, 18)
+		line := fmt.Sprintf("  %s %-18s %3d/%-4d %-7s %-11s %-9s %s", caret, name, s.Running, s.Total, sizeStr, imgCell, ram, status)
 		if i == m.sel {
 			b.WriteString(tuiSelectedStyle.Render(truncate(line, m.width-2)))
 		} else {
-			b.WriteString(tuiNormalStyle.Render(fmt.Sprintf("  %-20s %3d/%-4d ", name, s.Running, s.Total)))
+			b.WriteString(tuiNormalStyle.Render(fmt.Sprintf("  %s %-18s %3d/%-4d ", caret, name, s.Running, s.Total)))
 			b.WriteString(tuiDimStyle.Render(fmt.Sprintf("%-7s ", sizeStr)))
 			imgStyle := tuiRedStyle
 			if len(s.Images) > 0 && cached == len(s.Images) {
@@ -1378,6 +1464,34 @@ func (m menuModel) renderStacks() string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// renderStackChildRow draws an indented child container beneath an expanded
+// stack, colored by run state, with its used-RAM and short status.
+func (m menuModel) renderStackChildRow(c tuiContainer, selected bool) string {
+	running := strings.EqualFold(c.State, "running")
+	glyph := "■"
+	stStyle := tuiStoppedStyle
+	if running {
+		glyph, stStyle = "●", tuiRunningStyle
+	}
+	status := c.Status
+	if status == "" {
+		status = c.State
+	}
+	mem := m.data.MemStats[c.Name]
+	if idx := strings.Index(mem, "/"); idx >= 0 {
+		mem = strings.TrimSpace(mem[:idx])
+	}
+	name := truncate(c.Name, 26)
+	if selected {
+		line := fmt.Sprintf("      └ %s %-26s %-9s %s", glyph, name, mem, truncate(status, 24))
+		return tuiSelectedStyle.Render(truncate(line, m.width-2))
+	}
+	return tuiDimStyle.Render("      └ ") +
+		stStyle.Render(fmt.Sprintf("%s %-26s ", glyph, name)) +
+		tuiYellowStyle.Render(fmt.Sprintf("%-9s ", mem)) +
+		tuiDimStyle.Render(truncate(status, 28))
 }
 
 // stackRAM sums the used-memory of this stack's containers (best-effort parse).
@@ -1427,18 +1541,61 @@ func tuiParseMiB(s string) float64 {
 }
 
 func (m menuModel) handleStacksKey(k string) (tea.Model, tea.Cmd) {
-	items := m.filteredStacks()
-	if m.sel >= len(items) {
-		m.sel = maxInt(0, len(items)-1)
+	rows := m.stackTreeRows()
+	if m.sel >= len(rows) {
+		m.sel = maxInt(0, len(rows)-1)
 	}
 	switch k {
 	case "up", "k", "down", "j", "pgup", "pgdown", "home", "end":
-		m.moveCursor(k, len(items))
-	case "enter", "tab":
-		if len(items) == 0 {
+		m.moveCursor(k, len(rows))
+	case " ":
+		// SPACE toggles expand/collapse of the stack under the cursor; on a child
+		// row it collapses the parent and jumps the cursor back up to it.
+		if len(rows) == 0 {
 			return m, nil
 		}
-		s := items[m.sel]
+		if m.stacksExpanded == nil {
+			m.stacksExpanded = map[string]bool{}
+		}
+		r := rows[m.sel]
+		if r.isChild {
+			delete(m.stacksExpanded, r.parent)
+			for i := m.sel; i >= 0; i-- {
+				if !rows[i].isChild && rows[i].stack.Name == r.parent {
+					m.sel = i
+					break
+				}
+			}
+		} else {
+			name := r.stack.Name
+			if m.stacksExpanded[name] {
+				delete(m.stacksExpanded, name)
+			} else if len(m.containersInStack(name)) > 0 {
+				m.stacksExpanded[name] = true
+			}
+		}
+	case "enter", "tab":
+		if len(rows) == 0 {
+			return m, nil
+		}
+		r := rows[m.sel]
+		if r.isChild {
+			c := r.cont
+			stackFile := m.stackFileForContainer(c.Name)
+			acts := tuiContainerActions
+			if zeroScaleAvailable() {
+				n := len(tuiContainerActions)
+				acts = append([]tuiAction{}, tuiContainerActions[:n-1]...)
+				acts = append(acts, tuiAction{"⚡  Zero Scale…", "zeroscale"})
+				acts = append(acts, tuiContainerActions[n-1])
+			}
+			m.popup = tuiActionPopup("Container: "+truncate(c.Name, 24), acts,
+				func(action string) (menuModel, tea.Cmd) {
+					return m.doContainerAction(c.Name, stackFile, action)
+				})
+			return m, nil
+		}
+		s := r.stack
 		m.popup = tuiActionPopup("Stack: "+truncate(s.Name, 24), tuiStackActions,
 			func(action string) (menuModel, tea.Cmd) {
 				return m.doStackAction(s.Name, action)
@@ -1454,6 +1611,7 @@ func (m menuModel) handleStacksKey(k string) (tea.Model, tea.Cmd) {
 
 // tuiStackActions mirrors STACK_ACTIONS.
 var tuiStackActions = []tuiAction{
+	{"📋  View containers", "containers"},
 	{"▶  Start", "up"},
 	{"■  Stop", "down"},
 	{"↺  Restart", "restart"},
@@ -1523,6 +1681,29 @@ func (m menuModel) openReclaimPopup() (menuModel, tea.Cmd) {
 func (m menuModel) doStackAction(name, action string) (menuModel, tea.Cmd) {
 	switch action {
 	case "", "cancel":
+		return m, nil
+	case "containers":
+		var names []string
+		state := map[string]string{}
+		for _, c := range m.data.Containers {
+			if c.Stack == name {
+				names = append(names, c.Name)
+				state[c.Name] = c.State
+			}
+		}
+		sort.Strings(names)
+		var lines []string
+		for _, n := range names {
+			ind := "○"
+			if strings.EqualFold(state[n], "running") {
+				ind = "●"
+			}
+			lines = append(lines, fmt.Sprintf("%s %-30s %s", ind, truncate(n, 30), state[n]))
+		}
+		if len(lines) == 0 {
+			lines = []string{"(no live containers for this stack)"}
+		}
+		m.popup = &tuiPopup{kind: tuiPopupDetail, title: "Containers in " + truncate(name, 20), lines: lines}
 		return m, nil
 	case "open_editor":
 		f := stackFileFor(name)
@@ -3258,7 +3439,11 @@ func (m menuModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// lowercase a-z = letter jump (uppercase stays a command on Updates/Network)
 		if len(msg.Runes) == 1 {
 			r := msg.Runes[0]
-			if r >= 'a' && r <= 'z' {
+			// On the Updates tab, c/f/p are action keys (Check / Force / Pull) — let
+			// them fall through to the tab handler instead of the A-Z letter jump,
+			// since Shift is awkward on the on-screen keyboard.
+			updAction := m.tab == tabUpdates && (r == 'c' || r == 'f' || r == 'p')
+			if r >= 'a' && r <= 'z' && !updAction {
 				ch := string(r)
 				if m.fltLetter == ch {
 					m.fltLetter = ""
@@ -3517,11 +3702,11 @@ func (m menuModel) handleUpdatesKey(k string) (tea.Model, tea.Cmd) {
 		if len(rows) > 0 {
 			m.popup = &tuiPopup{kind: tuiPopupDetail, title: "Update detail", lines: tuiUpdateDetail(rows[m.sel])}
 		}
-	case "C":
+	case "C", "c":
 		return m, tuiSelfCmd("Check updates", "update")
-	case "F":
+	case "F", "f":
 		return m, tuiSelfCmd("Force check", "update", "--force")
-	case "P":
+	case "P", "p":
 		return m, tuiSelfCmd("Pull updates", "update", "--pull")
 	}
 	return m, nil
@@ -4083,6 +4268,7 @@ func (m menuModel) handleUpgradeKey(k string) (tea.Model, tea.Cmd) {
 var tuiBuildItems = []tuiAction{
 	{"Build new service (wizard)", "build_into"},
 	{"Create new stack + add service", "build_new_stack"},
+	{"⬇  Pre-pull an image (search 12 registries)", "prepull"},
 	{"Generate dynamics from ALL stacks", "gen_dyn_all"},
 	{"Generate dynamics from one stack", "gen_dyn_one"},
 	{"Force regen ALL dynamics", "gen_dyn_force"},
@@ -4111,6 +4297,20 @@ func (m menuModel) handleBuildKey(k string) (tea.Model, tea.Cmd) {
 
 func (m menuModel) doBuildAction(action string) (menuModel, tea.Cmd) {
 	switch action {
+	case "prepull":
+		// Pre-pull (cache) an image without scaffolding a service. Pops the SAME
+		// little input box the build wizard uses ("search for…"), then opens the
+		// SAME multi-registry search (cmdRegsearch): ~12 registries queried
+		// concurrently, keyword + registry filter + A-Z/paging, ENTER pulls the
+		// highlighted image inline. Blank = open the search with no seed term.
+		m.popup = tuiInputPopup("Pre-pull image", "Image/keyword to search for (blank = open search):", "",
+			func(term string) (menuModel, tea.Cmd) {
+				if term == "" {
+					return m, tuiExecSelf("regsearch")
+				}
+				return m, tuiExecSelf("regsearch", term)
+			})
+		return m, nil
 	case "build_into":
 		// Launch the REAL interactive build wizard (same 9-step flow as the
 		// Python menu): stack pick → Docker Hub image search → IP → port →
