@@ -2033,6 +2033,64 @@ func dispPruneSnapshots() {
 	}
 }
 
+// dispDiff previews what `fix`/repair WOULD change in a stack's compose file,
+// without touching the live file. It copies the stack to a throwaway file beside
+// the original (so relative paths still resolve), runs the real repair on the
+// copy, and prints a colored unified diff. Usage: `stacks diff <stack>`.
+func dispDiff(args []string) {
+	var stack string
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			stack = strings.TrimSuffix(strings.TrimSpace(a), ".yml")
+			break
+		}
+	}
+	if stack == "" {
+		fmt.Println("usage: stacks diff <stack>")
+		return
+	}
+	sd := fxLoadConf()["STACKS_DIR"]
+	live := filepath.Join(sd, stack+".yml")
+	if _, err := os.Stat(live); err != nil {
+		fmt.Printf("\x1b[1;31m✘ no such stack: %s (looked in %s)\x1b[0m\n", stack, sd)
+		return
+	}
+	tmp, err := os.CreateTemp(sd, ".stacksdiff-*.yml")
+	if err != nil {
+		fmt.Println("diff: cannot create temp file:", err)
+		return
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+	if err := dispCopyFile(live, tmpPath); err != nil {
+		fmt.Println("diff: copy failed:", err)
+		return
+	}
+	// run the REAL repair against the throwaway copy — never the live file
+	repair_loop(tmpPath, 25, "")
+	out, _ := exec.Command("diff", "-u", live, tmpPath).Output()
+	if len(strings.TrimSpace(string(out))) == 0 {
+		fmt.Printf("\x1b[1;32m✔ %s: clean — fix/repair would change nothing.\x1b[0m\n", stack)
+		return
+	}
+	fmt.Printf("\x1b[1;36m── preview: what `fix` would change in %s.yml (nothing written) ──\x1b[0m\n", stack)
+	for _, line := range strings.Split(string(out), "\n") {
+		switch {
+		case strings.HasPrefix(line, "+++"), strings.HasPrefix(line, "---"):
+			fmt.Printf("\x1b[90m%s\x1b[0m\n", line)
+		case strings.HasPrefix(line, "@@"):
+			fmt.Printf("\x1b[1;36m%s\x1b[0m\n", line)
+		case strings.HasPrefix(line, "+"):
+			fmt.Printf("\x1b[32m%s\x1b[0m\n", line)
+		case strings.HasPrefix(line, "-"):
+			fmt.Printf("\x1b[31m%s\x1b[0m\n", line)
+		default:
+			fmt.Println(line)
+		}
+	}
+}
+
 func dispRestoreSnapshot(snap string) {
 	if st, err := os.Stat(snap); err != nil || !st.IsDir() {
 		// follow symlink

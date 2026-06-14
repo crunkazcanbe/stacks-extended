@@ -95,6 +95,8 @@ func Run() {
 		dispManage(dispParse(cmd, rest))
 	case "recreate":
 		dispRecreate(dispParse(cmd, rest))
+	case "diff", "preview":
+		dispDiff(rest) // commands.go — show what fix/repair WOULD change, no writes
 	case "heal", "healall", "fixall", "allfix":
 		// one-word do-everything: up + force-recreate (fix/repair/dynamics are
 		// applied via the ported fix/repair/dynamics engines as needed)
