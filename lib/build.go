@@ -794,14 +794,8 @@ func buildSvc(name, image, ip, port string, cfg buildConf, svcNum int, db, redis
 		vols = append(vols, fmt.Sprintf(`      - "%s"`, v))
 	}
 
-	sg := cfg.SablierGroup
-	if sg == "" {
-		sg = strings.ReplaceAll(strings.ReplaceAll(name, "-", ""), "_", "")
-	}
 	labels := []string{
 		`      - "traefik.enable=true"`,
-		`      - "sablier.enable=true"`,
-		fmt.Sprintf(`      - "sablier.group=%s"`, sg),
 	}
 	for _, l := range cfg.ExtraLabels {
 		labels = append(labels, fmt.Sprintf(`      - "%s"`, l))
