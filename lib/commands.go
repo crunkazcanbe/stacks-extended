@@ -1985,7 +1985,52 @@ func dispTakeSnapshot(label string) string {
 	}
 	// short line — just the snapshot name, not the full path
 	fmt.Printf("\x1b[1;32m✔ Snapshot saved: %s\x1b[0m\n", filepath.Base(snap))
+	dispPruneSnapshots()
 	return snap
+}
+
+// dispPruneSnapshots keeps only the newest SNAPSHOT_KEEP (default 5) labeled
+// "<label>_<ts>" snapshot dirs created by `snapshot take`. Never prunes
+// "golden*" snapshots. Fixes the bug where these accumulated unbounded.
+func dispPruneSnapshots() {
+	keep := 5
+	if v := strings.TrimSpace(confValue("SNAPSHOT_KEEP")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			keep = n
+		}
+	}
+	dir := dispSnapshotDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	re := regexp.MustCompile(`_\d{8}_\d{6}$`)
+	type snapInfo struct {
+		path string
+		mt   time.Time
+	}
+	var snaps []snapInfo
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, "golden") || !re.MatchString(name) {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		snaps = append(snaps, snapInfo{filepath.Join(dir, name), info.ModTime()})
+	}
+	if len(snaps) <= keep {
+		return
+	}
+	sort.Slice(snaps, func(i, j int) bool { return snaps[i].mt.After(snaps[j].mt) }) // newest first
+	for _, old := range snaps[keep:] {
+		os.RemoveAll(old.path)
+	}
 }
 
 func dispRestoreSnapshot(snap string) {
